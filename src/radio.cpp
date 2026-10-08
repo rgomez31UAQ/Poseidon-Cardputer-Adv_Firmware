@@ -186,7 +186,29 @@ bool radio_switch(radio_domain_t target)
          * features that hop ch12-14. */
         break;
     case RADIO_BLE:
-        Serial.printf("[radio] enter RADIO_BLE setup. bt_ctrl_status=%d\n",
+        /* Cardputer ADV has NO usable PSRAM (hardware-confirmed) and only
+         * ~512 KB internal SRAM. teardown_current() for WiFi only calls
+         * esp_wifi_stop(), leaving the driver's RX/TX buffer pools + DMA
+         * RAM resident. The ESP32-S3 BLE controller must allocate its HCI
+         * buffer pools from that same internal SRAM, so a resident WiFi
+         * driver starves it and NimBLEDevice::init() deadlocks on the
+         * controller handshake (observed: Bluetooth->Tracker hard-freeze).
+         * Fully deinit WiFi here to reclaim that SRAM for BLE. This runs
+         * ONLY on a WiFi->BLE transition, not the WiFi->WiFi session churn
+         * that POS-AUDIT-008 banned esp_wifi_deinit for, so the heap-
+         * fragmentation risk doesn't apply. wifi_lean_sta_init() does a
+         * clean fresh init (netif handle is probed, not cached) on the way
+         * back to any WiFi feature. */
+        {
+            wifi_mode_t wm = WIFI_MODE_NULL;
+            if (esp_wifi_get_mode(&wm) == ESP_OK) {
+                esp_wifi_stop();
+                esp_wifi_deinit();
+                delay(50);
+            }
+        }
+        Serial.printf("[radio] enter RADIO_BLE setup. heap=%u bt_ctrl_status=%d\n",
+                      (unsigned)ESP.getFreeHeap(),
                       (int)esp_bt_controller_get_status());
         Serial.flush();
         if (!NimBLEDevice::isInitialized()) {
