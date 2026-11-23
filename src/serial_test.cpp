@@ -5,6 +5,11 @@
 #include "input.h"
 #include "menu.h"
 #include "version.h"
+#include "gps.h"
+#include "heap_budget.h"
+#include "ui.h"
+#include "theme.h"
+#include "ui_ambient.h"
 #include <Arduino.h>
 
 extern const menu_node_t *g_current_feature_item;  /* from menu.cpp */
@@ -36,11 +41,32 @@ static void serial_cmd_task(void *)
                     uint32_t idle = input_last_input_ms() ? (now - input_last_input_ms()) : 0;
                     const char *feat = g_current_feature_item
                         ? g_current_feature_item->label : "(menu)";
-                    Serial.printf("[STATE] heap=%u up=%lu idle=%lu feat=\"%s\"\n",
-                                  (unsigned)ESP.getFreeHeap(),
+                    Serial.printf("[STATE] heap=%u largest=%u min=%u up=%lu idle=%lu feat=\"%s\"\n",
+                                  (unsigned)heap_free_internal(),
+                                  (unsigned)heap_largest_internal(),
+                                  (unsigned)heap_min_ever_internal(),
                                   (unsigned long)(now - boot_ms),
                                   (unsigned long)idle,
                                   feat);
+                    Serial.printf("[UI_STATE] theme=%d layout=%d motion=%d large=%d ambient=%d\n",
+                                  (int)theme_current_id(), (int)menu_style_get(),
+                                  ui_motion_enabled(), ui_big_text(), ui_ambient_enabled());
+                }
+                else if (buf[0] == 'D') {
+                    // Display access stays on the UI task, never this serial task.
+                    input_inject(PK_UI_CAPTURE);
+                }
+                else if (buf[0] == 'T') {
+                    static const char *const names[] = {
+                        "loopTask", "ser_cmd", "ir_park", "sfx", "gps", "wdr_hop"
+                    };
+                    for (const char *name : names) {
+                        TaskHandle_t task = xTaskGetHandle(name);
+                        if (task) {
+                            Serial.printf("[TASK] %-8s spare=%u\n", name,
+                                          (unsigned)uxTaskGetStackHighWaterMark(task));
+                        }
+                    }
                 }
                 else if (buf[0] == 'R') {
                     Serial.println("[CMD] reset");
@@ -51,6 +77,27 @@ static void serial_cmd_task(void *)
                     /* TEMP DIAGNOSTIC: CC1101 chip-ID + live RSSI probe. */
                     extern void cc1101_diag(void);
                     cc1101_diag();
+                }
+                else if (buf[0] == 'G') {
+                    const gps_diag_t &dg = gps_diag();
+                    const gps_fix_t &fix = gps_get();
+                    Serial.printf("GPS] baud=%lu bytes=%lu lines=%lu GGA=%lu RMC=%lu q=%d status=%c overflows=%lu last=\"%s\"\n",
+                                  (unsigned long)gps_current_baud(),
+                                  (unsigned long)dg.bytes,
+                                  (unsigned long)dg.lines,
+                                  (unsigned long)dg.gga,
+                                  (unsigned long)dg.rmc,
+                                  dg.last_gga_quality,
+                                  dg.last_rmc_status ? dg.last_rmc_status : '-',
+                                  (unsigned long)dg.overflows,
+                                  dg.last);
+                    Serial.printf("GPS] GGA=\"%s\"\nGPS] RMC=\"%s\"\n",
+                                  dg.last_gga[0] ? dg.last_gga : "(none)",
+                                  dg.last_rmc[0] ? dg.last_rmc : "(none)");
+                    Serial.printf("GPS] fix=%s sats=%u lat=%.6f lon=%.6f alt=%.1f hdop=%.1f utc=\"%s\"\n",
+                                  fix.valid ? "yes" : "no",
+                                  fix.sats, fix.lat_deg, fix.lon_deg, fix.alt_m,
+                                  fix.hdop, fix.utc);
                 }
                 else if (buf[0] == '?') {
                     Serial.printf("[CMD] poseidon %s harness=v1\n",
@@ -72,5 +119,5 @@ static void serial_cmd_task(void *)
 
 void serial_test_init(void)
 {
-    xTaskCreate(serial_cmd_task, "ser_cmd", 4096, nullptr, 1, nullptr);
+    xTaskCreate(serial_cmd_task, "ser_cmd", 3072, nullptr, 1, nullptr);
 }

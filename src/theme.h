@@ -1,5 +1,5 @@
 /*
- * theme.h — six curated palettes.
+ * theme.h — curated palettes; POSEIDON uses the Deepwater visual system.
  *
  *   POSEIDON cyberpunk: cyan / magenta / purple on black with strategic
  *                       magenta splashes. The default. Designed for
@@ -40,17 +40,22 @@ struct poseidon_theme_t {
 };
 
 enum theme_id_t {
-    THEME_POSEIDON = 0,   /* cyberpunk cyan/magenta/purple — default */
+    THEME_POSEIDON = 0,   /* Deepwater navy / ice / cyan — default */
     THEME_MATRIX,         /* souped-up hacker green-on-black */
     THEME_EINK,           /* paper white, daytime / minimal */
     THEME_SYNTHWAVE,      /* vaporwave magenta + cyan on midnight grape */
     THEME_PHANTOM,        /* deep violet — matches phantom-* suite */
     THEME_BLOOD,          /* fsociety red on pure black */
+    THEME_AMBER_CRT,      /* 80s phosphor amber terminal */
+    THEME_NIGHT_CITY,     /* vivid cyberpunk electric yellow + cyan */
+    THEME_SOLARIS,        /* solar gold & warm plasma on charcoal */
+    THEME_NORDIC_FROST,   /* glacial ice-cyan & silver on arctic navy */
+    THEME_GHOST_PURPLE,   /* neon electric purple on obsidian */
     THEME__COUNT
 };
 
 void theme_init(void);               /* load from NVS on boot */
-void theme_set(theme_id_t id);       /* apply + persist to NVS */
+bool theme_set(theme_id_t id);       /* apply + persist; false on storage failure */
 void theme_preview(theme_id_t id);   /* apply in RAM only — no NVS write */
 theme_id_t theme_current_id(void);
 const poseidon_theme_t &theme(void);

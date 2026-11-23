@@ -2,10 +2,14 @@
  * gps.cpp — minimal NMEA parser (GGA + RMC).
  */
 #include "gps.h"
+#include "gps_nmea.h"
 #include <HardwareSerial.h>
+#include <M5Unified.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <sys/time.h>
+#include <time.h>
 
 static HardwareSerial s_uart(1);
 static gps_fix_t s_fix = {};
@@ -29,6 +33,13 @@ static volatile bool s_gps_alive = false;
 bool gps_begin(void)
 {
     if (s_started) return true;
+    /* CAP-LoRa1262 reference software enables the Cardputer's external 5V
+     * rail before opening the ATGM336H receiver. Make that requirement
+     * explicit instead of relying on the board-default power configuration. */
+    M5.Power.setExtOutput(true);
+    /* Match Bruce's Cardputer GPS startup: release the shared RX pad before
+     * attaching UART1 so a prior peripheral owner cannot hold it. */
+    pinMode(GPS_UART_RX_PIN, INPUT);
     s_uart.begin(s_baud, SERIAL_8N1, GPS_UART_RX_PIN, GPS_UART_TX_PIN);
     s_started = true;
     return true;
@@ -52,10 +63,11 @@ void gps_end(void)
     s_uart.end();
     /* gps-002: HardwareSerial::end() does not release the pin mode —
      * the UART driver leaves TX in OUTPUT (driven LOW or HIGH depending
-     * on idle state) and RX with whatever pull was last set. CC1101 +
-     * LoRa park sequences re-claim pin 13 (GPS TX) for CS/CSn parking;
-     * leaving it driven creates bus contention with whoever asserts CS
-     * next. Tri-state both ends so HSPI cs-park paths can drive cleanly. */
+     * on idle state) and RX with whatever pull was last set. Hydra park
+     * re-claims GPIO 13 (GPS UART TX / CC1101 CS) and drives it high;
+     * leaving the UART driver on that pad fights the chip-select.
+     * Tri-state both ends so the HSPI park paths can drive cleanly.
+     * GPIO 15 (GPS UART RX) is not a Hydra pin. */
     pinMode(GPS_UART_TX_PIN, INPUT);
     pinMode(GPS_UART_RX_PIN, INPUT);
     s_started = false;
@@ -75,7 +87,7 @@ bool gps_user_enabled(void)
 {
     if (!s_user_enabled_loaded) {
         Preferences p;
-        if (p.begin("gps", true)) {
+        if (p.begin("gps", false)) {
             s_user_enabled_cache = p.getUChar("enabled", 0) ? true : false;
             p.end();
         }
@@ -109,6 +121,16 @@ static void gps_task_fn(void *_)
     vTaskDelete(nullptr);
 }
 
+void gps_resume_if_enabled(void)
+{
+    if (!gps_user_enabled()) return;
+    if (!s_started) gps_begin();
+    if (!s_gps_task) {
+        s_gps_stop = false;
+        xTaskCreate(gps_task_fn, "gps", 2304, nullptr, 2, &s_gps_task);
+    }
+}
+
 bool gps_ensure_running(void)
 {
     /* Opening the GPS or Wardrive menu IS the opt-in event — record
@@ -117,7 +139,7 @@ bool gps_ensure_running(void)
     if (!s_started) gps_begin();
     if (!s_gps_task) {
         s_gps_stop = false;  /* clear any prior cooperative-stop request */
-        xTaskCreate(gps_task_fn, "gps", 3072, nullptr, 2, &s_gps_task);
+        xTaskCreate(gps_task_fn, "gps", 2304, nullptr, 2, &s_gps_task);
     }
     return s_started;
 }
@@ -209,13 +231,27 @@ static int split_csv(char *line, char **fields, int max)
     return n;
 }
 
+static void invalidate_fix(void)
+{
+    gps_fix_t fix = s_fix;
+    fix.valid = false;
+    fix.time_ms = millis();
+    portENTER_CRITICAL(&s_fix_mux);
+    s_fix = fix;
+    portEXIT_CRITICAL(&s_fix_mux);
+}
+
 static void parse_gga(char *line)
 {
     char *f[16] = {0};
     int n = split_csv(line, f, 16);
     if (n < 10) return;
     int fix_quality = atoi(f[6]);
-    if (fix_quality < 1) return;
+    s_diag.last_gga_quality = fix_quality;
+    if (fix_quality < 1) {
+        invalidate_fix();
+        return;
+    }
     gps_fix_t fix = s_fix;
     fix.lat_deg = nmea_to_degrees(f[2], f[3][0]);
     fix.lon_deg = nmea_to_degrees(f[4], f[5][0]);
@@ -235,13 +271,36 @@ static void parse_rmc(char *line)
     char *f[16] = {0};
     int n = split_csv(line, f, 16);
     if (n < 10) return;
-    if (f[2][0] != 'A') return;  /* A = active, V = void */
+    if (f[2][0] != 'A') {
+        s_diag.last_rmc_status = f[2][0];
+        invalidate_fix();
+        return;  /* A = active, V = void */
+    }
+    s_diag.last_rmc_status = f[2][0];
     gps_fix_t fix = s_fix;
     fix.lat_deg    = nmea_to_degrees(f[3], f[4][0]);
     fix.lon_deg    = nmea_to_degrees(f[5], f[6][0]);
     fix.speed_kts  = (float)atof(f[7]);
     fix.course_deg = (float)atof(f[8]);
     strncpy(fix.date, f[9], sizeof(fix.date) - 1);
+    /* Seed the ESP system clock from GPS UTC so FAT timestamps and future
+     * capture filenames are meaningful even when WiFi/NTP is unavailable. */
+    if (strlen(f[1]) >= 6 && strlen(f[9]) == 6) {
+        struct tm utc = {};
+        utc.tm_hour = (f[1][0] - '0') * 10 + (f[1][1] - '0');
+        utc.tm_min  = (f[1][2] - '0') * 10 + (f[1][3] - '0');
+        utc.tm_sec  = (f[1][4] - '0') * 10 + (f[1][5] - '0');
+        utc.tm_mday = (f[9][0] - '0') * 10 + (f[9][1] - '0');
+        utc.tm_mon  = (f[9][2] - '0') * 10 + (f[9][3] - '0') - 1;
+        utc.tm_year = 100 + (f[9][4] - '0') * 10 + (f[9][5] - '0');
+        setenv("TZ", "UTC0", 1);
+        tzset();
+        time_t epoch = mktime(&utc);
+        if (epoch > 1577836800) {
+            struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+            settimeofday(&tv, nullptr);
+        }
+    }
     /* Do NOT set s_fix.valid here. RMC's "A" status only means the
      * GPS module's NMEA layer is happy, not that we have a 3D fix —
      * a 2D fix can report 'A' while GGA reports fix-quality=0. The
@@ -259,14 +318,38 @@ static void process_line(char *line)
     s_diag.lines++;
     strncpy(s_diag.last, line, sizeof(s_diag.last) - 1);
     s_diag.last[sizeof(s_diag.last) - 1] = '\0';
+    /* Capture the receiver's raw validity fields before the shared helper
+     * can reject a no-fix sentence. */
+    char probe[128];
+    strncpy(probe, line, sizeof(probe) - 1);
+    probe[sizeof(probe) - 1] = '\0';
+    char *fields[16] = {0};
+    int field_count = split_csv(probe, fields, 16);
+    if ((strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) && field_count > 6) {
+        strncpy(s_diag.last_gga, line, sizeof(s_diag.last_gga) - 1);
+        s_diag.last_gga[sizeof(s_diag.last_gga) - 1] = '\0';
+        s_diag.last_gga_quality = atoi(fields[6]);
+    } else if ((strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) && field_count > 2) {
+        strncpy(s_diag.last_rmc, line, sizeof(s_diag.last_rmc) - 1);
+        s_diag.last_rmc[sizeof(s_diag.last_rmc) - 1] = '\0';
+        s_diag.last_rmc_status = fields[2][0];
+    }
     /* Drop sentences whose *HH checksum doesn't match — RF noise / baud
      * glitches can otherwise yield a valid-looking but wrong fix. */
     if (!nmea_checksum_ok(line)) return;
     if (strncmp(line, "$GPGGA", 6) == 0 || strncmp(line, "$GNGGA", 6) == 0) {
         s_diag.gga++;
+        if (!gps_nmea_sentence_has_fix(line)) {
+            invalidate_fix();
+            return;
+        }
         parse_gga(line);
     } else if (strncmp(line, "$GPRMC", 6) == 0 || strncmp(line, "$GNRMC", 6) == 0) {
         s_diag.rmc++;
+        if (!gps_nmea_sentence_has_fix(line)) {
+            invalidate_fix();
+            return;
+        }
         parse_rmc(line);
     }
 }

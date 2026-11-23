@@ -2,9 +2,30 @@
 
 #include <SPI.h>
 
-/* SD chip-select on the shared HSPI bus. Exposed here (not buried in the .cpp)
- * so CC1101/nRF24 bus-parking can deselect it via one canonical macro. */
-#define SD_CS 12
+/* Shared HSPI bus (microSD + Hydra CC1101/nRF24 + CAP-LoRa1262).
+ * Exposed here so radio parking and CC1101 setSpiPin stay on one map:
+ *   SCK=40  MISO=39  MOSI=14  SD CS=12
+ *   Hydra CC1101 CS=13 GDO0=5, nRF24 CS=6 CE=4 (see cc1101_hw.h / nrf24_hw.h). */
+#define SD_SCK   40
+#define SD_MISO  39
+#define SD_MOSI  14
+#define SD_CS    12
+
+#define SD_POSEIDON_ROOT       "/poseidon"
+#define SD_CAPTURE_ROOT        "/poseidon/captures"
+#define SD_WARDRIVE_DIR        "/poseidon/captures/wardrive"
+#define SD_BLE_CAPTURE_DIR     "/poseidon/captures/ble"
+#define SD_SURVEILLANCE_DIR    "/poseidon/captures/surveillance"
+#define SD_DEFMON_DIR          "/poseidon/captures/defmon"
+#define SD_WIFI_CAPTURE_DIR    "/poseidon/captures/wifi"
+#define SD_SUBGHZ_CAPTURE_DIR  "/poseidon/captures/subghz"
+#define SD_CREDENTIALS_DIR     "/poseidon/credentials"
+
+#define SD_HASHCAT_PATH        SD_WIFI_CAPTURE_DIR "/hashcat.22000"
+#define SD_CREDS_PATH          SD_CREDENTIALS_DIR "/creds.log"
+#define SD_NTLM_PATH           SD_CREDENTIALS_DIR "/ntlm.log"
+#define SD_NTLM_HASHES_PATH    SD_CREDENTIALS_DIR "/ntlm_hashes.txt"
+#define SD_WHISPERPAIR_PATH    SD_BLE_CAPTURE_DIR "/whisperpair.csv"
 
 /*
  * sd_helper — one place that knows the M5Cardputer SD pins + SPI
@@ -14,6 +35,9 @@
  */
 bool sd_mount(void);
 bool sd_is_mounted(void);
+
+/* Initialize the shared HSPI pins even when no SD card is inserted. */
+bool sd_prepare_bus(void);
 
 /* Content wipe: recursive delete of every file/dir. Only does a real
  * f_mkfs if the card is UNmountable to begin with. Re-mounts on
@@ -35,6 +59,10 @@ SPIClass &sd_get_spi(void);
 /* Force a fresh remount — use after another SPI peripheral (CC1101)
  * has stolen the GPIO matrix from HSPI. */
 bool sd_remount(void);
+
+/* Create the standard capture/credential directory tree. Existing files in
+ * /poseidon are deliberately left in place for backward compatibility. */
+bool sd_ensure_layout(void);
 
 #include <FS.h>
 
@@ -60,6 +88,18 @@ File sdlog_open(const char *stem,
                 const char *header_line = nullptr,
                 char *out_path = nullptr,
                 size_t out_path_sz = 0);
+
+/* Directory-aware variant for organized capture output. `directory` must be
+ * one of the standard paths above; the layout is created automatically. */
+File sdlog_open_in(const char *directory,
+                   const char *stem,
+                   const char *header_line = nullptr,
+                   char *out_path = nullptr,
+                   size_t out_path_sz = 0);
+
+/* Open the organized path first, then an old root-level path so cards from
+ * earlier firmware releases remain readable without moving their contents. */
+File sd_open_read_compat(const char *path, const char *legacy_path);
 
 /*
  * sd_rotate_on_size — net-009 / POS-AUDIT-269.

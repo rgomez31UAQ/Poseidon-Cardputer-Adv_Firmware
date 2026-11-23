@@ -19,6 +19,7 @@
 #include "wifi_types.h"
 #include "c5_cmd.h"
 #include "sd_helper.h"
+#include "ble_db.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
@@ -40,6 +41,14 @@ static bool     s_filter_open_only = false;
 /* Shared with portal, deauth, ap-clone. Declared in wifi_types.h. */
 ap_t g_last_selected_ap = {};
 bool g_last_selected_valid = false;
+
+extern void feat_wifi_deauth(void);
+extern void feat_wifi_deauth_broadcast_ap(const ap_t &target);
+extern void feat_wifi_pmkid(void);
+extern void feat_wifi_clients(void);
+extern void feat_wifi_apclone(void);
+extern void feat_wifi_portal(void);
+extern void c5_deauth_dashboard(const ap_t &target, bool broadcast);
 
 static const char *auth_str(uint8_t a)
 {
@@ -72,7 +81,7 @@ static bool ap_matches_filter(const ap_t &a)
     return false;
 }
 
-#define SCAN_ROWS 9
+#define SCAN_ROWS (ui_big_text() ? 3 : 8)
 
 /* Build the filtered index list (visible items). Returns count. */
 static int build_filtered(int *idx)
@@ -87,15 +96,14 @@ static int build_filtered(int *idx)
 /* Header row with AP count + filter status. Overwritten in place. */
 static void draw_list_header(void)
 {
-    char buf[40];
+    char buf[64];
     if (s_filter[0] || s_filter_open_only) {
         snprintf(buf, sizeof(buf), "APs %d  filter:%s%s", s_ap_count,
                  s_filter, s_filter_open_only ? "+open" : "");
     } else {
         snprintf(buf, sizeof(buf), "APs %d", s_ap_count);
     }
-    ui_text_w(4, BODY_Y + 2, SCR_W - 8,
-              (s_filter[0] || s_filter_open_only) ? T_WARN : T_ACCENT, "%s", buf);
+    ui_header(buf);
 }
 
 /* Paint one AP row in full over its own background (no body clear). */
@@ -104,11 +112,22 @@ static void draw_ap_row(int r, const int *idx, int first, int cursor)
     auto &d = M5Cardputer.Display;
     int ai = idx[first + r];
     const ap_t &a = s_aps[ai];
-    int y = BODY_Y + 14 + r * 11;
+    const bool large = ui_big_text();
+    const int row_height = large ? 29 : 11;
+    int y = BODY_Y + 20 + r * row_height;
     bool sel = (first + r == cursor);
-    uint16_t bg = sel ? 0x18A3 : T_BG;
+    uint16_t bg = sel ? T_SEL_BG : T_BG;
     uint16_t fg = sel ? T_ACCENT : T_FG;
-    d.fillRect(0, y - 1, SCR_W, 11, bg);
+    d.fillRect(0, y - 1, SCR_W, row_height, bg);
+    if (large) {
+        ui_label(6, y, 228, fg, bg, a.ssid[0] ? a.ssid : "(hidden)", 2);
+        char metadata[40];
+        snprintf(metadata, sizeof(metadata), "%s  CH %u  %d dBm  %s",
+                 a.is_5g ? "5G" : "2G", a.channel, a.rssi, auth_str(a.auth));
+        ui_label(6, y + 18, 228, T_DIM, bg, metadata);
+        if (sel) d.fillRect(0, y, 2, row_height - 3, T_ACCENT);
+        return;
+    }
 
     /* band tag | ch | rssi | auth | ssid */
     d.setTextColor(a.is_5g ? T_ACCENT : T_DIM, bg);
@@ -132,24 +151,27 @@ static void draw_ap_row(int r, const int *idx, int first, int cursor)
         d.print("W");
     }
     d.setTextColor(fg, bg);
-    d.setCursor(94, y);
-    d.print(a.ssid);
+    ui_label(94, y, 138, fg, bg, a.ssid[0] ? a.ssid : "(hidden)");
+    if (sel) d.fillRect(0, y, 2, 8, T_ACCENT);
 }
 
 /* Full window repaint over a one-time body clear. Used at entry and after
  * any full-screen event (detail view, help modal) overwrites the body. */
 static void draw_list(int cursor)
 {
-    ui_clear_body();
+    auto &d = M5Cardputer.Display;
+    d.fillRect(0, BODY_Y + 15, SCR_W, 4, T_BG);
+    d.fillRect(0, BODY_Y + 107, SCR_W, BODY_H - 107, T_BG);
     draw_list_header();
 
     int idx[MAX_APS];
     int n = build_filtered(idx);
     if (n == 0) {
+        M5Cardputer.Display.fillRect(0, BODY_Y + 16, SCR_W, BODY_H - 16, T_BG);
         auto &d = M5Cardputer.Display;
         d.setTextColor(T_DIM, T_BG);
         d.setCursor(4, BODY_Y + 18);
-        d.print(s_scan_running ? "scanning..." : "no matches");
+        d.print(s_scan_running ? "Scanning for networks..." : "No networks match this filter.");
         return;
     }
     if (cursor >= n) cursor = n - 1;
@@ -159,8 +181,12 @@ static void draw_list(int cursor)
     if (first < 0) first = 0;
     if (first + SCAN_ROWS > n) first = max(0, n - SCAN_ROWS);
 
-    for (int r = 0; r < SCAN_ROWS && first + r < n; ++r)
-        draw_ap_row(r, idx, first, cursor);
+    for (int r = 0; r < SCAN_ROWS; ++r) {
+        if (first + r < n) draw_ap_row(r, idx, first, cursor);
+        else d.fillRect(0, BODY_Y + 19 + r * (ui_big_text() ? 29 : 11),
+                        SCR_W, ui_big_text() ? 29 : 11, T_BG);
+    }
+    ui_scrollbar(237, BODY_Y + 19, 88, first, SCAN_ROWS, n);
 }
 
 /* Other features use g_last_selected_ap. We set it here so the user
@@ -184,25 +210,44 @@ void wifi_show_ap_details(const ap_t &a)
     d.setCursor(4, BODY_Y + 2);  d.print("AP DETAILS");
     if (a.is_5g) {
         d.setTextColor(T_GOOD, T_BG);
-        d.setCursor(SCR_W - 24, BODY_Y + 2); d.print("[5G]");
+        d.setCursor(SCR_W - 28, BODY_Y + 2); d.print("[5G]");
     }
-    d.drawFastHLine(4, BODY_Y + 12, 100, T_ACCENT);
+    d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT);
+
+    uint32_t oui = ((uint32_t)a.bssid[0] << 16) | ((uint32_t)a.bssid[1] << 8) | a.bssid[2];
+    const char *vendor = ble_db_oui(oui);
+
     d.setTextColor(T_FG, T_BG);
-    d.setCursor(4, BODY_Y + 18); d.printf("SSID : %.24s", a.ssid);
-    d.setCursor(4, BODY_Y + 30); d.printf("BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
+    ui_text(4, BODY_Y + 16, T_FG, "SSID %s", a.ssid);
+    d.setCursor(4, BODY_Y + 28); d.printf("BSSID: %02X:%02X:%02X:%02X:%02X:%02X",
         a.bssid[0], a.bssid[1], a.bssid[2], a.bssid[3], a.bssid[4], a.bssid[5]);
-    d.setCursor(4, BODY_Y + 42); d.printf("CH   : %u", a.channel);
-    d.setCursor(4, BODY_Y + 54); d.printf("RSSI : %d dBm", a.rssi);
-    d.setCursor(4, BODY_Y + 66); d.printf("AUTH : %s%s", auth_str(a.auth),
-                                                          a.wps ? "  WPS!" : "");
-    /* Actions that require a local softAP (clone/portal) or local
-     * promiscuous RX (clients) can't reach a 5 GHz target — the S3
-     * just can't tune there. Show a compact footer hint so the user
-     * knows what actually works for this AP. */
-    if (a.is_5g)
-        ui_draw_footer("D=deauth X=bcast (via C5)  `=back");
-    else
-        ui_draw_footer("D=dth X=bcast L=clnt C=clone P=portal `=back");
+    d.setTextColor(T_DIM, T_BG);
+    ui_text(4, BODY_Y + 40, T_DIM, "MFR  : %s", vendor ? vendor : "Unknown / Generic");
+    d.setTextColor(T_FG, T_BG);
+    d.setCursor(4, BODY_Y + 52); d.printf("CH   : %-3u   AUTH: %s%s", a.channel, auth_str(a.auth), a.wps ? " (WPS!)" : "");
+
+    /* Signal Bar */
+    int bar_w = 110;
+    int pct = (a.rssi + 100) * 100 / 70;
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    d.setCursor(4, BODY_Y + 64); d.printf("RSSI : %d dBm", a.rssi);
+    d.drawRect(95, BODY_Y + 64, bar_w, 7, T_DIM);
+    uint16_t col = (a.rssi > -60) ? T_GOOD : (a.rssi > -80) ? T_WARN : T_BAD;
+    d.fillRect(96, BODY_Y + 65, (bar_w - 2) * pct / 100, 5, col);
+
+    /* Actions */
+    d.setTextColor(T_ACCENT2, T_BG);
+    d.setCursor(4, BODY_Y + 76);
+    if (a.is_5g) {
+        d.print("D=deauth  X=broadcast (via C5)");
+        d.setCursor(4, BODY_Y + 87);
+        d.print("`=back to scan list");
+    } else {
+        d.print("D=deauth X=bcast M=pmkid C=clone");
+        d.setCursor(4, BODY_Y + 87);
+        d.print("L=clients P=portal   `=back");
+    }
+    ui_draw_footer("pick an action");
 
     while (true) {
         uint16_t k = input_poll();
@@ -213,8 +258,6 @@ void wifi_show_ap_details(const ap_t &a)
         case 'd':
             if (a.is_5g) {
                 if (!c5_any_online()) { ui_toast("no C5 paired", T_BAD, 1200); break; }
-                /* Same dashboard UX as 2.4 GHz deauth, just routed via
-                 * the C5 satellite. ESC stops, SPACE pauses. */
                 c5_deauth_dashboard(a, false);
             } else {
                 feat_wifi_deauth();
@@ -225,10 +268,12 @@ void wifi_show_ap_details(const ap_t &a)
                 if (!c5_any_online()) { ui_toast("no C5 paired", T_BAD, 1200); break; }
                 c5_deauth_dashboard(a, true);   /* broadcast on the AP's ch */
             } else {
-                /* Broadcast-deauth THIS AP only (not nuke-all). */
                 feat_wifi_deauth_broadcast_ap(a);
             }
             return;
+        case 'm':
+            if (a.is_5g) { ui_toast("pmkid: 2.4G only", T_WARN, 1000); break; }
+            feat_wifi_pmkid(); return;
         case 'l':
             if (a.is_5g) { ui_toast("clients: 2.4G only", T_WARN, 1000); break; }
             feat_wifi_clients(); return;
@@ -259,53 +304,35 @@ static void ensure_scan_evt(void) {
     }
 }
 
-#define RADAR_CX 58
-#define RADAR_CY (BODY_Y + 56)
-#define RADAR_R  40
+static int s_painted_pass = -1;
+static int s_painted_found = -1;
 
 /* Static chrome, drawn once before the sweep starts. */
 static void scan_screen_static(void) {
     ui_clear_body();
-    auto &d = M5Cardputer.Display;
-    d.setTextSize(2);
-    d.setTextColor(T_ACCENT, T_BG);
-    d.setCursor(110, BODY_Y + 14); d.print("SCANNING");
-    d.setTextSize(1);
-    d.setTextColor(T_DIM, T_BG);
-    d.setCursor(110, BODY_Y + 36); d.print("2.4 GHz  all ch");
-    ui_draw_footer("`=cancel");
+    ui_header("WIFI SCAN", "LIVE");
+    ui_label(8, BODY_Y + 27, 224, T_FG, T_BG, "Finding networks", 2);
+    ui_label(8, BODY_Y + 51, 224, T_DIM, T_BG, "2.4 GHz / all channels");
+    s_painted_pass = -1;
+    s_painted_found = -1;
+    ui_draw_footer("` cancel");
 }
 
-/* One animation frame: clear + redraw the radar (so the sweep doesn't smear),
- * plot a contact per AP found so far, and refresh the live counters. */
+/* Small busy indicator; counters repaint only when actual data changes. */
 static void scan_screen_frame(int pass, int found, uint32_t elapsed) {
     auto &d = M5Cardputer.Display;
-    d.fillRect(RADAR_CX - RADAR_R - 2, RADAR_CY - RADAR_R - 2,
-               (RADAR_R + 2) * 2, (RADAR_R + 2) * 2, T_BG);
-    ui_radar(RADAR_CX, RADAR_CY, RADAR_R, T_ACCENT2);
-    for (int i = 0; i < found && i < MAX_APS; ++i) {
-        float ang = i * 2.39996f;                 /* golden angle, spreads them out */
-        int rssi = s_aps[i].rssi;
-        if (rssi > -30) rssi = -30;
-        if (rssi < -90) rssi = -90;
-        int dist = 6 + (RADAR_R - 12) * (rssi + 90) / 60;   /* stronger = closer in */
-        int x = RADAR_CX + (int)(cosf(ang) * dist);
-        int y = RADAR_CY + (int)(sinf(ang) * dist);
-        d.fillCircle(x, y, 2, T_GOOD);
-        d.drawPixel(x, y, 0xFFFF);
+    (void)elapsed;
+    if (pass != s_painted_pass) {
+        s_painted_pass = pass;
+        if (pass <= 2) ui_text_w(8, BODY_Y + 72, 174, T_DIM, "Local pass %d / 2", pass);
+        else ui_label(8, BODY_Y + 72, 174, T_DIM, T_BG, "Satellite merge");
     }
-    d.setTextSize(1);
-    d.fillRect(110, BODY_Y + 50, SCR_W - 110, 46, T_BG);
-    d.setTextColor(T_DIM, T_BG);
-    d.setCursor(110, BODY_Y + 54); d.printf("pass %d/2", pass);
-    d.setTextColor(T_GOOD, T_BG);
-    d.setCursor(110, BODY_Y + 70); d.printf("found %d ap%s", found, found == 1 ? "" : "s");
-    d.setTextColor(T_ACCENT, T_BG);
-    char sweep[10] = "sweep";
-    int dots = (elapsed / 300) % 4;
-    for (int i = 0; i < dots; ++i) sweep[5 + i] = '.';
-    sweep[5 + dots] = '\0';
-    d.setCursor(110, BODY_Y + 86); d.print(sweep);
+    if (found != s_painted_found) {
+        s_painted_found = found;
+        ui_text_w(8, BODY_Y + 91, 174, T_GOOD, "%d networks found", found);
+    }
+    d.fillRect(198, BODY_Y + 68, 26, 26, T_BG);
+    ui_radar(211, BODY_Y + 81, 10, T_ACCENT);
 }
 
 /* Run one scan pass non-blocking, animating until SCAN_DONE. Returns false if
@@ -474,7 +501,7 @@ void feat_wifi_scan(void)
             while (millis() < deadline) {
                 /* Keep the scan screen alive — animate the same radar so the
                  * 5 GHz merge wait doesn't read as a freeze. */
-                scan_screen_frame(2, s_ap_count, millis());
+                scan_screen_frame(3, s_ap_count, millis());
                 if (millis() - last_chk > 150) {
                     last_chk = millis();
                     c5_ap_t tmp[4];
@@ -506,6 +533,7 @@ void feat_wifi_scan(void)
     }
 
     ui_draw_footer("/=flt O=open S=save R=rescan ENTER=info `=back");
+    ui_force_clear_body();
     draw_list(s_saved_cursor);
 
     int cursor = s_saved_cursor;
@@ -572,6 +600,7 @@ void feat_wifi_scan(void)
             last_cursor  = cursor;
             last_first   = first;
             last_running = s_scan_running;
+            ui_scrollbar(237, BODY_Y + 19, 88, first, SCAN_ROWS, n);
         }
         /* Radar sweep in top-right while scanning. */
         if (s_scan_running) ui_radar(SCR_W - 16, BODY_Y + 8, 7, 0x07FF);
@@ -619,9 +648,21 @@ void feat_wifi_scan(void)
             break;
         case 's': case 'S': {
             if (s_ap_count == 0) { ui_toast("no results", T_WARN, 800); last_count = -1; break; }
+            /* Keep the highlighted AP as the next Connect target. The CSV
+             * export remains a report; credentials are still collected only
+             * by WiFi Connect. */
+            int selected_idx[MAX_APS];
+            int selected_n = 0;
+            for (int i = 0; i < s_ap_count; ++i)
+                if (ap_matches_filter(s_aps[i])) selected_idx[selected_n++] = i;
+            if (selected_n > 0 && cursor < selected_n) {
+                g_last_selected_ap = s_aps[selected_idx[cursor]];
+                g_last_selected_valid = true;
+            }
             char path[64];
-            File f = sdlog_open("wifiscan", "ssid,bssid,channel,rssi,auth",
-                                path, sizeof(path));
+            File f = sdlog_open_in(SD_WIFI_CAPTURE_DIR, "wifiscan",
+                                   "ssid,bssid,channel,rssi,auth",
+                                   path, sizeof(path));
             if (!f) { ui_toast("SD open failed", T_BAD, 1000); last_count = -1; break; }
             int wrote = 0;
             for (int i = 0; i < s_ap_count; ++i) {

@@ -21,6 +21,7 @@
 #include "ble_types.h"
 #include "ble_db.h"
 #include "../sigdb_bt.h"
+#include "../sigdb_surveillance.h"
 #include "sd_helper.h"
 #include <NimBLEDevice.h>
 #include <SD.h>
@@ -43,11 +44,12 @@ struct ble_dev_t {
     uint8_t  addr[6];
     char     name[20];
     char     type[24];   /* "AirPods Pro 2 (USB-C)", "Samsung", etc. */
+    char     extra[32];  /* Battery / Telemetry / FastPair Model */
     int8_t   rssi;
     bool     is_public;
 };
 
-#define BLE_MAX_DEVS 48
+#define BLE_MAX_DEVS 32
 
 static ble_dev_t s_devs[BLE_MAX_DEVS];
 static int       s_count = 0;
@@ -65,12 +67,85 @@ static void sanitize(const char *in, char *out, size_t out_sz)
     out[j] = '\0';
 }
 
+/* Extract deep telemetry: Apple Continuity battery levels, FastPair models, etc. */
+static void decode_extra_telemetry(const NimBLEAdvertisedDevice *d, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    std::string md;
+    if (d->haveManufacturerData()) md = d->getManufacturerData();
+
+    if (md.size() >= 3 && (uint8_t)md[0] == 0x4C && (uint8_t)md[1] == 0x00) {
+        /* Apple Continuity */
+        uint8_t type = (uint8_t)md[2];
+        if (type == 0x07 && md.size() >= 8) {
+            /* Proximity Pairing: AirPods battery nibbles */
+            uint8_t b_main = (uint8_t)md[6];
+            uint8_t b_case = (uint8_t)md[7];
+            int bat_l = (b_main & 0x0F) * 10;
+            int bat_r = ((b_main >> 4) & 0x0F) * 10;
+            int bat_c = (b_case & 0x0F) * 10;
+            if (bat_l <= 100 && bat_r <= 100) {
+                snprintf(out, out_sz, "L:%d%% R:%d%% Case:%d%%", bat_l, bat_r, bat_c);
+                return;
+            }
+        } else if (type == 0x10) {
+            uint8_t act = md.size() >= 6 ? (uint8_t)md[5] : 0;
+            snprintf(out, out_sz, "Nearby Action (0x%02X)", act);
+            return;
+        } else if (type == 0x09) {
+            snprintf(out, out_sz, "AirTag / Find My");
+            return;
+        } else if (type == 0x05) {
+            snprintf(out, out_sz, "AirDrop Present");
+            return;
+        } else if (type == 0x0C) {
+            snprintf(out, out_sz, "Apple Handoff");
+            return;
+        }
+    } else if (md.size() >= 2 && (uint8_t)md[0] == 0x75 && (uint8_t)md[1] == 0x00) {
+        snprintf(out, out_sz, "Samsung SmartThings/Buds");
+        return;
+    } else if (md.size() >= 2 && (uint8_t)md[0] == 0x06 && (uint8_t)md[1] == 0x00) {
+        snprintf(out, out_sz, "MS SwiftPair Beacon");
+        return;
+    }
+
+    /* Google Fast Pair (Service Data 0xFE9F) */
+    if (d->haveServiceData()) {
+        for (int i = 0; i < d->getServiceDataCount(); ++i) {
+            NimBLEUUID u = d->getServiceDataUUID(i);
+            std::string s = u.toString();
+            if (s.find("fe9f") != std::string::npos || s.find("FE9F") != std::string::npos) {
+                std::string sd = d->getServiceData(i);
+                if (sd.size() >= 3) {
+                    uint32_t model = ((uint32_t)(uint8_t)sd[0] << 16) | ((uint32_t)(uint8_t)sd[1] << 8) | (uint8_t)sd[2];
+                    const char *fp_name = ble_db_fastpair(model);
+                    if (fp_name) snprintf(out, out_sz, "FP: %s", fp_name);
+                    else         snprintf(out, out_sz, "FastPair (0x%06X)", (unsigned)model);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /* Best-effort type classification using the full ble_db tables. */
 static void classify(const NimBLEAdvertisedDevice *d, char *out, size_t out_sz)
 {
     /* Raw manufacturer data for the db to parse. */
     std::string md;
     if (d->haveManufacturerData()) md = d->getManufacturerData();
+
+    /* Raven/ShotSpotter advertises a stable company identifier. Check it
+     * before the general vendor database so the saved BLE CSV preserves the
+     * surveillance tag instead of only reporting the manufacturer name. */
+    if (md.size() >= 2) {
+        uint16_t cid = (uint16_t)((uint8_t)md[0] | ((uint8_t)md[1] << 8));
+        if (raven_company_match(cid)) {
+            snprintf(out, out_sz, "RAVEN-BLE");
+            return;
+        }
+    }
 
     /* NimBLE stores the MAC little-endian. Reverse for display/OUI.
      * Crucial: bind the NimBLEAddress to a named local first —
@@ -118,6 +193,10 @@ static void classify(const NimBLEAdvertisedDevice *d, char *out, size_t out_sz)
                 got16 = true;
             }
             if (got16) {
+                if (raven_uuid_match(u16)) {
+                    snprintf(out, out_sz, "RAVEN-UUID");
+                    return;
+                }
                 const char *nm = ble_db_svc_uuid(u16);
                 if (nm) { snprintf(out, out_sz, "%s", nm); return; }
                 /* sigdb_bt extras — Eddystone, Fast Pair, Drone RID, etc. */
@@ -131,7 +210,7 @@ static void classify(const NimBLEAdvertisedDevice *d, char *out, size_t out_sz)
 
 static volatile uint32_t s_cb_fire_count = 0;
 
-class scan_cb : public NimBLEScanCallbacks {
+class ble_scan_cb : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *d) override {
         s_cb_fire_count++;
         /* Dedup by address. */
@@ -149,15 +228,17 @@ class scan_cb : public NimBLEScanCallbacks {
         x.rssi = d->getRSSI();
         x.is_public = (addr.getType() == BLE_ADDR_PUBLIC);
         x.name[0] = '\0';
+        x.extra[0] = '\0';
         if (d->haveName()) sanitize(d->getName().c_str(), x.name, sizeof(x.name));
         classify(d, x.type, sizeof(x.type));
+        decode_extra_telemetry(d, x.extra, sizeof(x.extra));
     }
 };
 
 /* Static-allocated so repeat-entry doesn't leak. NimBLE doesn't own
  * the object after scan stops — it just drops the callback pointer. */
-static scan_cb s_cb_obj;
-static scan_cb *s_cb = &s_cb_obj;
+static ble_scan_cb s_cb_obj;
+static ble_scan_cb *s_cb = &s_cb_obj;
 
 static bool dev_matches_filter(const ble_dev_t &d)
 {
@@ -179,14 +260,12 @@ static void draw_list(int cursor)
 {
     auto &d = M5Cardputer.Display;
 
-    d.setTextColor(T_ACCENT, T_BG);
-    d.setCursor(4, BODY_Y + 2);
-    d.printf("BLE %d ", s_count);
-    if (s_filter[0]) {
-        d.setTextColor(T_WARN, T_BG);
-        d.printf(" filter:%s", s_filter);
-    }
-    d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT);
+    char header[64];
+    snprintf(header, sizeof(header), "BLE %d%s%s", s_count,
+             s_filter[0] ? " / " : "", s_filter);
+    ui_header(header);
+    d.fillRect(0, BODY_Y + 15, SCR_W, 4, T_BG);
+    d.fillRect(0, BODY_Y + 107, SCR_W, BODY_H - 107, T_BG);
 
     /* Filter + window. */
     int idx[BLE_MAX_DEVS];
@@ -194,7 +273,9 @@ static void draw_list(int cursor)
     for (int i = 0; i < s_count; ++i)
         if (dev_matches_filter(s_devs[i])) idx[n++] = i;
 
-    const int rows = 9;
+    const bool large = ui_big_text();
+    const int rows = large ? 3 : 8;
+    const int row_height = large ? 29 : 11;
 
     if (n == 0) {
         d.fillRect(0, BODY_Y + 14, SCR_W, BODY_H - 14, T_BG);
@@ -211,29 +292,40 @@ static void draw_list(int cursor)
     if (first + rows > n) first = max(0, n - rows);
 
     for (int r = 0; r < rows; ++r) {
-        int y = BODY_Y + 16 + r * 11;
+        int y = BODY_Y + 20 + r * row_height;
         if (first + r >= n) {
-            d.fillRect(0, y - 1, SCR_W, 11, T_BG);   /* blank stale slot */
+            d.fillRect(0, y - 1, SCR_W, row_height, T_BG);
             continue;
         }
         int i = idx[first + r];
         const ble_dev_t &x = s_devs[i];
         bool sel = (first + r == cursor);
-        uint16_t bg = sel ? 0x18C7 : T_BG;
-        d.fillRect(0, y - 1, SCR_W, 11, bg);          /* row owns its bg */
+        uint16_t bg = sel ? T_SEL_BG : T_BG;
+        d.fillRect(0, y - 1, SCR_W, row_height, bg);
+        if (large) {
+            ui_label(6, y, 228, sel ? T_ACCENT : T_FG, bg,
+                     x.name[0] ? x.name : x.type, 2);
+            char metadata[40];
+            snprintf(metadata, sizeof(metadata), "%d dBm / %s", x.rssi, x.type);
+            ui_label(6, y + 18, 228, T_DIM, bg, metadata);
+            if (sel) d.fillRect(0, y, 2, row_height - 3, T_ACCENT);
+            continue;
+        }
 
         d.setTextColor(T_ACCENT, bg);
         d.setCursor(2, y);  d.printf("%4d", x.rssi);
-        d.setTextColor(x.is_public ? T_WARN : T_GOOD, bg);
-        d.setCursor(30, y); d.printf("%-14.14s", x.type);
+        ui_label(30, y, 84, sel ? T_FG : T_DIM, bg, x.type);
         d.setTextColor(sel ? T_ACCENT : T_FG, bg);
-        d.setCursor(124, y);
         if (x.name[0]) {
-            d.printf("%.19s", x.name);
+            ui_label(124, y, 108, sel ? T_ACCENT : T_FG, bg, x.name);
         } else {
-            d.printf("%02X:%02X:%02X", x.addr[3], x.addr[4], x.addr[5]);
+            char address[16];
+            snprintf(address, sizeof(address), "%02X:%02X:%02X", x.addr[3], x.addr[4], x.addr[5]);
+            ui_label(124, y, 108, T_DIM, bg, address);
         }
+        if (sel) d.fillRect(0, y, 2, 8, T_ACCENT);
     }
+    ui_scrollbar(237, BODY_Y + 19, 88, first, rows, n);
 }
 
 /* Drain a NimBLEScanResults into s_devs as a belt-and-suspenders pass.
@@ -261,7 +353,7 @@ static void drain_scan_results(NimBLEScanResults &results)
     }
 }
 
-static void start_scan(void)
+static void start_scan(bool reset_controller = false)
 {
     Serial.printf("[ble] entry heap=%u\n", (unsigned)ESP.getFreeHeap());
     Serial.flush();
@@ -285,24 +377,26 @@ static void start_scan(void)
      *   - setDuplicateFilter(false).
      *   - getResults(ms) is blocking — populates the list internally;
      *     we iterate the returned object, not a callback buffer. */
-    if (NimBLEDevice::isInitialized()) {
+    if (reset_controller && NimBLEDevice::isInitialized()) {
         Serial.println("[ble] deinit"); Serial.flush();
         NimBLEDevice::deinit(true);
-    }
-    /* Animated settle instead of a blind delay(500) — the controller needs
-     * ~500 ms after deinit before init, and the old blank wait looked frozen. */
-    uint32_t settle = millis() + 500;
-    while (millis() < settle) {
-        ui_scanning_indicator("starting BLE", -1);
-        delay(20);
+        /* Animated settle instead of a blind delay(500) — the controller needs
+         * ~500 ms after deinit before init, and the old blank wait looked frozen. */
+        uint32_t settle = millis() + 500;
+        while (millis() < settle) {
+            ui_scanning_indicator("starting BLE", -1);
+            delay(20);
+        }
     }
 
-    ui_scanning_indicator("starting BLE", -1);   /* fresh sweep just before the blocking init */
-    Serial.println("[ble] init"); Serial.flush();
-    if (!NimBLEDevice::init("")) {
-        Serial.println("[ble] init FAILED"); Serial.flush();
-        s_scanning = false;   /* clear the flag we raised up front */
-        return;
+    if (!NimBLEDevice::isInitialized()) {
+        ui_scanning_indicator("starting BLE", -1);
+        Serial.println("[ble] init"); Serial.flush();
+        if (!NimBLEDevice::init("")) {
+            Serial.println("[ble] init FAILED"); Serial.flush();
+            s_scanning = false;
+            return;
+        }
     }
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -331,8 +425,10 @@ static void start_scan(void)
             x.rssi      = device->getRSSI();
             x.is_public = (addr.getType() == BLE_ADDR_PUBLIC);
             x.name[0]   = '\0';
+            x.extra[0]  = '\0';
             if (device->haveName()) sanitize(device->getName().c_str(), x.name, sizeof(x.name));
             classify(device, x.type, sizeof(x.type));
+            decode_extra_telemetry(device, x.extra, sizeof(x.extra));
         }
     };
 
@@ -449,7 +545,7 @@ void feat_ble_scan(void)
         case ';': case PK_UP:    cursor = (cursor > 0) ? cursor - 1 : 0; break;
         case '.': case PK_DOWN:  cursor++; break;
         case 'r': case 'R':
-            if (!s_scanning) { s_count = 0; start_scan(); }
+            if (!s_scanning) { s_count = 0; start_scan(true); }
             break;
         case '?':
             ui_show_current_help();
@@ -466,8 +562,9 @@ void feat_ble_scan(void)
         case 's': case 'S': {
             if (s_count == 0) { ui_toast("no results", T_WARN, 800); break; }
             char path[64];
-            File f = sdlog_open("blescan", "mac,addr_type,type,name,rssi",
-                                path, sizeof(path));
+            File f = sdlog_open_in(SD_BLE_CAPTURE_DIR, "blescan",
+                                   "mac,addr_type,type,name,rssi",
+                                   path, sizeof(path));
             if (!f) { ui_toast("SD open failed", T_BAD, 1000); break; }
             int wrote = 0;
             for (int i = 0; i < s_count; ++i) {
@@ -511,33 +608,46 @@ void feat_ble_scan(void)
             auto &d = M5Cardputer.Display;
             ui_clear_body();
             d.setTextColor(T_ACCENT, T_BG);
-            d.setCursor(4, BODY_Y + 2); d.print("BLE DEVICE");
-            d.drawFastHLine(4, BODY_Y + 12, 100, T_ACCENT);
+            d.setCursor(4, BODY_Y + 2); d.print("BLE DEVICE INFO");
+            d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT);
             d.setTextColor(T_FG, T_BG);
-            d.setCursor(4, BODY_Y + 18);
-            d.printf("MAC  : %02X:%02X:%02X:%02X:%02X:%02X",
+            d.setCursor(4, BODY_Y + 15);
+            d.printf("MAC  : %02X:%02X:%02X:%02X:%02X:%02X (%s)",
                      x.addr[0], x.addr[1], x.addr[2],
-                     x.addr[3], x.addr[4], x.addr[5]);
-            d.setCursor(4, BODY_Y + 30); d.printf("TYPE : %s", x.type);
-            d.setCursor(4, BODY_Y + 42); d.printf("NAME : %.28s", x.name[0] ? x.name : "(unnamed)");
-            d.setCursor(4, BODY_Y + 54); d.printf("ADDR : %s", x.is_public ? "public" : "random");
+                     x.addr[3], x.addr[4], x.addr[5],
+                     x.is_public ? "public" : "random");
+            d.setTextColor(T_ACCENT2, T_BG);
+            d.setCursor(4, BODY_Y + 26); d.printf("TYPE : %s", x.type);
+            d.setTextColor(T_FG, T_BG);
+            d.setCursor(4, BODY_Y + 37); d.printf("NAME : %.28s", x.name[0] ? x.name : "(unnamed)");
+            if (x.extra[0]) {
+                d.setTextColor(T_GOOD, T_BG);
+                d.setCursor(4, BODY_Y + 48);
+                d.printf("INFO : %.28s", x.extra);
+            } else {
+                uint32_t oui = ((uint32_t)x.addr[0] << 16) | ((uint32_t)x.addr[1] << 8) | x.addr[2];
+                const char *v = x.is_public ? ble_db_oui(oui) : nullptr;
+                d.setTextColor(T_DIM, T_BG);
+                d.setCursor(4, BODY_Y + 48);
+                d.printf("VEN  : %s", v ? v : "(random / unlisted)");
+            }
 
-            /* Signal strength bar: -100 dBm → empty, -30 dBm → full. */
-            int bar_w = 120;
+            /* Signal strength bar */
+            int bar_w = 110;
             int pct = (x.rssi + 100) * 100 / 70;
             if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-            d.setCursor(4, BODY_Y + 64); d.printf("RSSI : %d dBm", x.rssi);
-            d.drawRect(90, BODY_Y + 64, bar_w, 7, T_DIM);
+            d.setTextColor(T_FG, T_BG);
+            d.setCursor(4, BODY_Y + 60); d.printf("RSSI : %d dBm", x.rssi);
+            d.drawRect(95, BODY_Y + 60, bar_w, 7, T_DIM);
             uint16_t col = (x.rssi > -60) ? T_GOOD : (x.rssi > -80) ? T_WARN : T_BAD;
-            d.fillRect(91, BODY_Y + 65, (bar_w - 2) * pct / 100, 5, col);
+            d.fillRect(96, BODY_Y + 61, (bar_w - 2) * pct / 100, 5, col);
 
-            /* Action legend in the BODY (full width, 2 lines) so nothing
-             * clips off the footer. T=track is the RSSI hot/cold finder. */
+            /* Action legend in the BODY */
             d.setTextColor(T_ACCENT2, T_BG);
-            d.setCursor(4, BODY_Y + 78);
-            d.print("T=track  W=whisper  H=hid  G=gatt");
-            d.setCursor(4, BODY_Y + 88);
-            d.print("X=flood  P=spam  C=clone   `=back");
+            d.setCursor(4, BODY_Y + 74);
+            d.print("T=track  G=gatt  W=whisper  H=hid");
+            d.setCursor(4, BODY_Y + 85);
+            d.print("X=flood  P=spam  C=clone    `=back");
             ui_draw_footer("pick an action");
             while (true) {
                 uint16_t k2 = input_poll();

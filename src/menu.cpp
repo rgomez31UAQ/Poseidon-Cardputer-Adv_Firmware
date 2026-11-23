@@ -15,6 +15,7 @@
 #include "menu_carousel.h"
 #include "heap_budget.h"
 #include "screensaver.h"
+#include <ui_layout.h>
 #include <Preferences.h>
 
 /* ---- menu render style: NVS-backed terminal/carousel toggle ---- */
@@ -25,7 +26,7 @@ menu_style_t menu_style_get(void)
 {
     if (!s_style_loaded) {
         Preferences p;
-        if (p.begin("pui", true)) {
+        if (p.begin("pui", false)) {
             uint8_t v = p.getUChar("mnustyle", (uint8_t)MENU_STYLE_TERMINAL);
             p.end();
             if (v >= MENU_STYLE__COUNT) v = MENU_STYLE_TERMINAL;
@@ -60,6 +61,7 @@ extern void feat_wifi_apclone(void);
 extern void feat_evil_twin(void);
 extern void feat_wifi_beacon_spam(void);
 extern void feat_wifi_wardrive(void);
+extern void feat_wifi_wardrive_hybrid(void);
 extern void feat_wifi_probe(void);
 extern void feat_wifi_karma(void);
 extern void feat_wifi_pmkid(void);
@@ -126,6 +128,7 @@ extern void feat_badusb_pranks(void);
 extern void feat_kerberos(void);
 extern void feat_net_portscan(void);
 extern void feat_net_ping(void);
+extern void feat_net_pingsweep(void);
 extern void feat_net_dns(void);
 extern void feat_net_responder(void);
 extern void feat_net_ssdp(void);
@@ -238,7 +241,7 @@ static const menu_node_t MENU_WIFI[] = {
       "Captive portal with DNS hijack. 16 templates: Google, Facebook, "
       "Microsoft, Free WiFi, Apple ID, Office 365, LinkedIn, Amazon, Netflix, "
       "Instagram, Hotel, Starbucks, Airport, Router Admin, Zoom, Company SSO. "
-      "Logs creds to /poseidon/creds.log on SD. NOTE: brings up the AP via "
+      "Logs creds to /poseidon/credentials/creds.log on SD. NOTE: brings up the AP via "
       "raw IDF (Bruce libs crash WiFi.softAP), which releases the BTDM heap "
       "one-way -- BLE features will be dead until reboot." },
     { 'i', "Evil Twin", "Clone AP + portal + auto-deauth chain", nullptr, feat_evil_twin,
@@ -247,7 +250,7 @@ static const menu_node_t MENU_WIFI[] = {
       "target BSSID on its channel) then 25s PORTAL (raw AP mode beaconing "
       "the target SSID + DNS hijack + Free WiFi captive page) repeating "
       "until ESC. Kicked clients re-associate to the rogue, hit the portal, "
-      "leak creds to /poseidon/creds.log. Concurrent APSTA is fragile on "
+      "leak creds to /poseidon/credentials/creds.log. Concurrent APSTA is fragile on "
       "Bruce libs -- time-slicing is the only stable path. PMF/WPA3 targets "
       "won't be kicked (deauth dropped) but the portal still works for any "
       "client that joins. 5G targets unsupported (S3 is 2.4 GHz only). "
@@ -289,7 +292,9 @@ static const menu_node_t MENU_WIFI[] = {
       "deauth (Spacehuhn/deauther.cc signature), evil twin (dup SSID/diff BSSID), "
       "beacon spam, WiFi Karma (probe-resp w/o beacon), BLE spoof (dup name/diff "
       "MAC), BLE flood. Time-slices WiFi promisc + NimBLE scan. Alerts → "
-      "/poseidon/defmon-<ts>.jsonl with GPS coords. Audio cue on each new class." },
+      "/poseidon/captures/defmon/ with GPS coords. Audio cue on each new class. "
+      "Live wifi/ble counters track every distinct device seen this session, and "
+      "every new WiFi AP is GPS-tagged to a WiGLE CSV alongside the anomaly log." },
     { 'u', "Cable Guard", "Detect malicious USB cable/charger RF implants", nullptr, feat_usb_guard,
       "Two-phase RF delta scan. Baseline 2.4 GHz APs with the suspect cable "
       "UNPLUGGED, then plug it in and re-scan: any radio that switched on with "
@@ -302,7 +307,7 @@ static const menu_node_t MENU_WIFI[] = {
       "Passive 2.4 GHz channel-hop scan that fingerprints Flock Safety "
       "ALPR cameras and ShotSpotter Raven gunshot sensors by OUI + SSID "
       "patterns + wildcard-probe behavior. GPS-tagged hits stream to "
-      "/poseidon/surv-<ts>.csv (WiGLE format) and .jsonl (Plume-compatible). "
+      "/poseidon/captures/surveillance/ as WiGLE CSV + Plume JSONL. "
       "5s dedup per BSSID. Source signatures: colonelpanichacks/flock-you, "
       "zmattmanz/Plume, DeFlockJoplin research." },
     { 'z', "CIW Zeroclick", "SSID injection payload broadcast", nullptr, feat_wifi_ciw,
@@ -347,7 +352,7 @@ static const menu_node_t MENU_C5[] = {
       "cannot capture handshakes from 5 GHz networks. C5 closes that gap. Pick "
       "a 5 GHz target, C5 locks its promisc receiver to the channel + BSSID and "
       "watches for EAPOL-Key M1 frames carrying a PMKID KDE. Hits stream back "
-      "over ESP-NOW and write directly to /poseidon/hashcat.22000 in WPA*01* "
+      "over ESP-NOW and write to /poseidon/captures/wifi/hashcat.22000 in WPA*01* "
       "format for offline cracking. Pair with Deauth 5G to force clients to "
       "reconnect and cough up a fresh M1." },
     { 'n', "Nuke 5G + HS", "Deauth-all + handshake capture, 5 GHz", nullptr, feat_c5_nuke_5g,
@@ -356,7 +361,7 @@ static const menu_node_t MENU_C5[] = {
       "broadcast deauth AND starts a 5-second HS capture listening on the "
       "same channel. Clients that get kicked re-auth right into the capture "
       "window. Both handshakes (WPA*02*) and PMKIDs (WPA*01*) that land go "
-      "straight to /poseidon/hashcat.22000. Runs until ESC. Glitch splash "
+      "straight to /poseidon/captures/wifi/hashcat.22000. Runs until ESC. Glitch splash "
       "aesthetic — live target + hit counts on-screen." },
     { 0, nullptr, nullptr, nullptr, nullptr, nullptr },
 };
@@ -388,7 +393,7 @@ static const menu_node_t MENU_BLE[] = {
       "any Part-89-compliant drone in range. Live target list + JSONL log "
       "with GPS-tagged observations. Source: GhostBLE (SmonSE)." },
     { 'n', "Sniffer", "Log all BLE adv -> SD CSV", nullptr, feat_ble_sniff,
-      "Dumps every BLE advertisement to /poseidon/blesniff-ts.csv with "
+      "Dumps every BLE advertisement to /poseidon/captures/ble/ with "
       "timestamp, MAC, RSSI, name, and raw adv hex. Useful for passive "
       "reconnaissance or offline analysis." },
     { 'b', "iBeacon", "Broadcast an iBeacon", nullptr, feat_ble_beacon,
@@ -427,7 +432,7 @@ static const menu_node_t MENU_BLE[] = {
       "Broadcasts fake Apple Find My / AirTag advertisements with random "
       "rotating keys. Passing iPhones with Find My enabled relay your 'tags' "
       "to iCloud's location service. Modes: 1 tag, flock of 8, flock of 32." },
-    { 'd', "Salty Deep", "Wireless toy scanner + controller", nullptr, feat_ble_toys,
+    { 'v', "Salty Deep", "Wireless toy scanner + controller", nullptr, feat_ble_toys,
       "Scans for Lovense / WeVibe / Satisfyer / Svakom / Kiiroo / Lelo / "
       "Magic Motion devices. Connect to a Lovense and control vibration "
       "intensity 0-20 via the keyboard. Number keys 1-9 jump to a level; "
@@ -437,7 +442,7 @@ static const menu_node_t MENU_BLE[] = {
       "JBL, Jabra, Pixel Buds, Nothing, OnePlus). Classifies each as "
       "pairable or in-use, then writes a bogus Key-Based Pairing blob to "
       "the FE2C service. Response = VULNERABLE. Silent drop = PATCHED. "
-      "Verdicts logged to /poseidon/whisperpair.csv. Probe only — the "
+      "Verdicts logged to /poseidon/captures/ble/whisperpair.csv. Probe only — the "
       "ESP32-S3 has no BR/EDR radio so we never complete the bond. "
       "Credit: COSIC KU Leuven." },
     { 'q', "BlueDucky", "BLE HID inject (CVE-2023-45866, Android)", nullptr, feat_ble_blueducky,
@@ -470,7 +475,7 @@ static const menu_node_t MENU_NET_ATTACKS[] = {
       "input as commands. Displays response. Simple reverse-shell relay." },
     { 'h', "Honeypot", "Fake telnet server on :23", nullptr, feat_honeypot,
       "Starts a WiFiServer on port 23 with a fake Ubuntu login banner. Logs "
-      "all usernames, passwords, and commands to /poseidon/honeypot.log on SD." },
+      "all usernames, passwords, and commands to /poseidon/captures/wifi/honeypot.log." },
     { 'd', "Dead Drop", "Hidden AP for anonymous file drops", nullptr, feat_dead_drop,
       "Creates a hidden AP with captive portal. Connected devices get a web page "
       "for uploading files and posting anonymous notes. Stored on SD." },
@@ -487,6 +492,9 @@ static const menu_node_t MENU_NET[] = {
     { 'p', "Port scan", "TCP portscan a host", nullptr, feat_net_portscan,
       "Connects to a range of TCP ports on a host IP/name. Requires you be "
       "joined to a WiFi network first (use Network -> Connect)." },
+    { 'w', "Ping Sweep", "Live /24 subnet active host grid", nullptr, feat_net_pingsweep,
+      "Fast ICMP sweep of the active /24 subnet. Displays a live 16x16 visual "
+      "grid of active and responding hosts on the LAN." },
     { 'i', "Ping", "ICMP echo loop", nullptr, feat_net_ping,
       "Live ping. Shows round-trip time and sequence. Runs until you ESC. "
       "Requires STA connection first." },
@@ -498,20 +506,20 @@ static const menu_node_t MENU_NET[] = {
       "Classic pentest credential-capture trick. When DNS fails on a LAN, "
       "Windows/macOS/Linux fall back to LLMNR, NBT-NS, and mDNS — we answer "
       "every query with our IP. Targets that trust the reply send us an NTLM "
-      "auth challenge which we log to /poseidon/ntlm.log for hashcat mode 5600." },
+      "auth challenge logged to /poseidon/credentials/ntlm.log for hashcat mode 5600." },
     { 'a', "LAN Recon", "Auto sweep + portscan + banners", nullptr, feat_net_lanrecon,
       "RaspyJack-style drop-box auto recon. Once you're joined to a WiFi "
       "network, this chains: ARP sweep of the /24 to find live hosts → "
       "TCP portscan of 16 common ports per host → banner grab on HTTP/SSH/"
       "Telnet → OUI vendor lookup on every MAC → full CSV export to "
-      "/poseidon/lan.csv. Result list is scrollable; ENTER on a host shows "
+      "/poseidon/captures/wifi/lan-<ts>.csv. Result list is scrollable; ENTER shows "
       "its full port map + banner." },
     { 'u', "UPnP scan", "Discover LAN UPnP devices", nullptr, feat_net_ssdp,
       "Sends SSDP M-SEARCH to 239.255.255.250:1900 and collects responses. "
       "Fetches each device's XML description to pull friendlyName + modelName. "
       "Great for mapping internal IoT: routers, printers, smart TVs, cameras, "
-      "NAS, Sonos, Chromecasts. Saves to /poseidon/ssdp.csv." },
-    { 'v', "CCTV Toolkit", "IP camera recon: ports/brand/rtsp/creds", nullptr, feat_cctv_scan,
+      "NAS, Sonos, Chromecasts. Saves under /poseidon/captures/wifi/." },
+    { 'v', "CCTV Toolkit", "ONVIF + IP camera ports/brand/RTSP", nullptr, feat_cctv_scan,
       "Credit: @7h30th3r0n3's Evil-M5Project. Scans targets for open camera "
       "ports (80 / 554 / 8080-83 / 8443 / 8554), HTTP-fingerprints the "
       "brand (Hikvision, Dahua, Axis, Vivotek, Panasonic, CPPlus), sprays "
@@ -520,7 +528,7 @@ static const menu_node_t MENU_NET[] = {
       "OPTIONS + DESCRIBE against common vendor stream paths "
       "(/Streaming/Channels/1, /cam/realmonitor, /live, etc.). "
       "Three modes: LAN /24 sweep, single IP, or read targets from "
-      "/poseidon/cctv-targets.txt. Hits go to /poseidon/cctv-<ts>.csv "
+      "/poseidon/cctv-targets.txt. Hits go under /poseidon/captures/surveillance/ "
       "with ports mask / brand / cred / stream URL." },
     { 'x', "Attacks", "UART / TCP / honeypot / printer / SSDP", MENU_NET_ATTACKS, nullptr,
       "Offensive network features: UART shell bridge, reverse TCP tunnel, "
@@ -542,10 +550,10 @@ static const menu_node_t MENU_NET[] = {
       "One-button full MitM chain: DHCP starvation to exhaust the legitimate "
       "pool, then rogue DHCP to hand out attacker gateway/DNS, then launches "
       "the captive portal for credential capture." },
-    { 'w', "WPAD Abuse", "Proxy autoconfig NTLM capture", nullptr, feat_wpad_abuse,
+    { 'z', "WPAD Abuse", "Proxy autoconfig NTLM capture", nullptr, feat_wpad_abuse,
       "Creates a SoftAP with DNS wildcard, serves wpad.dat pointing all "
       "traffic through our proxy, then challenges with NTLM 407 to capture "
-      "NTLMv2 hashes. Saved to /poseidon/ntlm_hashes.txt for hashcat 5600." },
+      "NTLMv2 hashes. Saved to /poseidon/credentials/ntlm_hashes.txt." },
     { 'e', "Autodiscover", "Exchange cred capture (Basic+NTLM)", nullptr, feat_autodiscover,
       "Fake Exchange Autodiscover endpoint. Offers Basic Auth first (plaintext "
       "capture on older Outlook) with NTLM fallback (NTLMv2 hash). Returns "
@@ -742,9 +750,10 @@ static const menu_node_t MENU_TOOLS[] = {
     { 'd', "Dice/8ball", "Dice, coin flip, magic 8-ball", nullptr, feat_tool_chance,
       "Randomizers. M cycles mode: 2d6 dice sum, heads/tails coin, or "
       "magic 8-ball answer. SPACE rolls." },
-    { 'm', "Morse", "Type text, sends in morse", nullptr, feat_tool_morse,
-      "Type a string and it blinks the screen cyan + beeps the speaker in "
-      "Morse code. Dot = 100ms, dash = 300ms." },
+    { 'm', "Morse", "Send or listen + decode morse", nullptr, feat_tool_morse,
+      "S: type a string and it blinks the screen cyan + beeps the speaker "
+      "in Morse code. L: listens through the mic and live-decodes incoming "
+      "morse tone timing back into text; unit speed auto-tracks the sender." },
     { 'r', "MAC rand", "Randomize WiFi MAC", nullptr, feat_tool_mac_rand,
       "Generates a random locally-administered MAC and applies it to the WiFi "
       "station interface. Resets on reboot." },
@@ -823,7 +832,7 @@ static const menu_node_t MENU_SUBGHZ[] = {
       "Learns the noise floor on a picked frequency for 10 seconds, then "
       "alerts on sustained spikes above baseline +15 dBm — the signature of "
       "a jammer or sustained TX in the band. Fires a red overlay + siren, "
-      "logs timestamp + peak RSSI to /poseidon/jamdetect.csv. Peer to the "
+      "logs timestamp + peak RSSI under /poseidon/captures/subghz/. Peer to the "
       "WiFi deauth detector. Use it to verify your jammer actually works "
       "or to flag hostile RF interference near a target." },
     { 0, nullptr, nullptr, nullptr, nullptr, nullptr },
@@ -892,22 +901,25 @@ static const menu_node_t MENU_SYS[] = {
       "Internal-heap free, largest contiguous block, and lifetime low-water "
       "mark. R reclaims recoverable caches (frees the ARGUS sprite etc.). "
       "The same numbers the portal and rf_preflight log to serial." },
-    { 't', "Theme", "POSEIDON / MATRIX / E-INK", nullptr, feat_theme_picker,
-      "Three curated palettes: POSEIDON (cyberpunk cyan/magenta/purple, "
-      "default), MATRIX (souped-up hacker green-on-black with cinematic "
-      "rain), E-INK (paper white for daylight / minimal mode). Live "
-      "preview, ENTER to commit." },
+    { 't', "Theme", "11 palettes / live preview", nullptr, feat_theme_picker,
+      "POSEIDON Deepwater is navy, ice-white and cyan. Ten alternate palettes "
+      "include MATRIX, E-INK and SYNTHWAVE. Browse to preview, ENTER to save, "
+      "Back to restore the original. Theme IDs and saved choices are preserved." },
+    { 'd', "Display", "Motion / large text / ambient", nullptr, feat_ui_preferences,
+      "M toggles reduced motion, B enlarges menu labels, scan results, help "
+      "and notifications, A toggles ambient "
+      "decoration. Reduced motion pauses ambient and decorative effects. "
+      "It does not stop live measurements. Ctrl+/ pages long shortcut footers." },
     { 'b', "Ambient", "Live ambient motion preview", nullptr, feat_ambient_preview,
       "Live preview of the active theme's ambient: POSEIDON paints TRON "
       "grid + cyan/magenta motes + magenta L-path packet, MATRIX runs "
       "souped-up phosphor rain, E-INK is intentionally clean. [A] toggles "
       "the NVS-backed enable flag globally if you ever want it off." },
     { 'l', "Layout", "Terminal / Carousel toggle", nullptr, feat_menu_style_toggle,
-      "Flip the menu render style. TERMINAL is the dense 7-row list with "
-      "letter mnemonics — fast for power-users. CAROUSEL is the big-card "
-      "single-focus layout with corner brackets, pulsing hotkey badge, "
-      "size-2 label, slide animation between siblings. Letter mnemonics "
-      "still work in Carousel mode. Persists to NVS." },
+      "TERMINAL is a compact six-row list with a selected-item description. "
+      "CAROUSEL shows one large domain icon, label, description and hotkey. "
+      "Both retain instant letter shortcuts, ENTER, Back and scrollable help. "
+      "The layout choice persists to NVS." },
     { 'v', "Screensaver", "Toggle 2-min idle takeover", nullptr, feat_screensaver_toggle,
       "Flip the screensaver on/off. After 2 minutes of no input, takes "
       "over the screen with a painter from the pool. Any key wakes it." },
@@ -1069,186 +1081,91 @@ static int count_children(const menu_node_t *parent)
     return n;
 }
 
-/* Lightweight idle-path companion to draw_menu. Repaints ONLY the gutter
- * strips that don't overlap row text — the strip between the magenta
- * underline and the first row, and the strip(s) below the last visible
- * row. ui_ambient_tick is called against the FULL body bounds inside a
- * setClipRect window so motes / grid / packet positions stay coherent
- * across frames instead of looping in a strip-sized box. Scroll arrows
- * are re-stamped because their bounding boxes overlap the strips. */
-static void draw_menu_anim(const menu_node_t *parent, int cursor)
-{
-    if (!ui_ambient_enabled()) return;
-    auto &d = M5Cardputer.Display;
-    int n = count_children(parent);
-    if (n <= 0) return;
-
-    const int rows    = 7;
-    const int row_h   = 13;
-    const int first_y = BODY_Y + 18;
-    const int visible = (n < rows) ? n : rows;
-    const int last_row_bottom = first_y + visible * row_h;
-
-    bool hint_drawn = false;
-    int  hint_y     = last_row_bottom + 2;
-    if (cursor >= 0 && cursor < n) {
-        const menu_node_t *sel = &parent->children[cursor];
-        if (sel->hint && hint_y < FOOTER_Y - 10) hint_drawn = true;
-    }
-    const int hint_bottom = hint_y + 8;
-
-    auto paint_strip = [&](int y, int h) {
-        if (h <= 0) return;
-        d.fillRect(0, y, SCR_W, h, T_BG);
-        d.setClipRect(0, y, SCR_W, h);
-        ui_ambient_tick(0, BODY_Y, SCR_W, BODY_H);
-    };
-
-    /* Strip 1: between magenta underline (BODY_Y+13) and first row. */
-    paint_strip(BODY_Y + 14, first_y - (BODY_Y + 14));
-    /* Strip 2: below last visible row to either hint top or footer. */
-    int s2_end = hint_drawn ? hint_y : (FOOTER_Y - 1);
-    paint_strip(last_row_bottom, s2_end - last_row_bottom);
-    /* Strip 3: below hint to footer. */
-    if (hint_drawn) paint_strip(hint_bottom, (FOOTER_Y - 1) - hint_bottom);
-
-    d.clearClipRect();
-
-    /* Re-stamp scroll arrows — their triangles overlap the strip zones. */
-    int first = cursor - rows / 2;
-    if (first < 0) first = 0;
-    if (first + rows > n) first = max(0, n - rows);
-    if (first > 0) {
-        d.fillTriangle(SCR_W - 7, first_y - 3,
-                       SCR_W - 3, first_y - 3,
-                       SCR_W - 5, first_y - 6, T_ACCENT2);
-    }
-    if (first + rows < n) {
-        int ay = first_y + rows * row_h - 2;
-        d.fillTriangle(SCR_W - 7, ay,
-                       SCR_W - 3, ay,
-                       SCR_W - 5, ay + 3, T_ACCENT2);
-    }
-}
-
 static const menu_node_t *s_menu_prev_parent = nullptr;
 static int                s_menu_prev_cursor  = -1;
 static int                s_menu_prev_first   = -1;
 static bool               s_menu_force        = true;
 
+static void draw_menu_row(const menu_node_t *parent, int index, int row, int cursor)
+{
+    auto &d = M5Cardputer.Display;
+    const menu_node_t *item = &parent->children[index];
+    const uint8_t scale = ui_big_text() ? 2 : 1;
+    const int row_height = scale == 2 ? 20 : 14;
+    const int y = BODY_Y + 19 + row * row_height;
+    const bool selected = index == cursor;
+    const uint16_t bg = selected ? T_SEL_BG : T_BG;
+    d.fillRect(4, y - 1, SCR_W - 10, row_height, T_BG);
+    if (selected) {
+        d.fillRoundRect(4, y - 1, SCR_W - 10, row_height - 1, 3, bg);
+        d.fillRect(4, y + 1, 2, row_height - 5, T_ACCENT);
+    }
+    char key[2] = {static_cast<char>(toupper(item->hotkey)), 0};
+    ui_label(12, y + 1, 12, T_ACCENT, bg, key);
+    ui_label(30, y + 1, 186, selected ? T_FG : T_DIM, bg, item->label, scale);
+    ui_label(220, y + 1, 6, selected ? T_ACCENT : T_DIM, bg, item->children ? ">" : "");
+}
+
 static void draw_menu(const menu_node_t *parent, int cursor)
 {
+    const uint32_t paint_started = millis();
     auto &d = M5Cardputer.Display;
 
     int n = count_children(parent);
 
-    const int rows       = 7;
-    const int row_h      = 13;
-    const int first_y    = BODY_Y + 18;
-    int first = cursor - rows / 2;
-    if (first < 0) first = 0;
-    if (first + rows > n) first = max(0, n - rows);
+    const int rows = ui_big_text() ? 4 : 6;
+    const int first = ui_layout::window_start(cursor, n, rows);
 
     if (!s_menu_force && parent == s_menu_prev_parent &&
         cursor == s_menu_prev_cursor && first == s_menu_prev_first) return;
-    s_menu_force       = false;
+    const bool full = s_menu_force || parent != s_menu_prev_parent || first != s_menu_prev_first;
+    const int previous = s_menu_prev_cursor;
+    s_menu_force = false;
     s_menu_prev_parent = parent;
     s_menu_prev_cursor = cursor;
     s_menu_prev_first  = first;
 
-    ui_force_clear_body();
-    /* Paint theme-aware ambient motion BEFORE menu chrome — rows draw
-     * over the top with their own opaque background so they remain
-     * readable. No-op when the user has disabled ambient via
-     * System -> Ambient. */
-    ui_ambient_tick(0, BODY_Y, SCR_W, BODY_H);
-
-    /* Title with count + scroll indicator. Title underline is a strategic
-     * magenta splash — full body width, 2 px thick — so the cyberpunk
-     * accent color reads from across the room as the dominant pop. */
-    d.setTextColor(T_ACCENT, T_BG);
-    d.setCursor(4, BODY_Y + 2);
-    d.printf("%s", parent->label);
-    (void)d.textWidth(parent->label);   /* kept for API parity with prior version */
-    d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT2);
-    d.drawFastHLine(4, BODY_Y + 13, SCR_W - 8, T_ACCENT2);
-
-    /* Root-menu-only C5/TRIDENT status panel. Larger + more prominent
-     * than the global status-bar badge so the user sees satellite
-     * pairing state the instant POSEIDON boots. */
-    if (parent == &MENU_ROOT) {
-        int n5 = c5_any_online() ? c5_peer_count() : 0;
-        int px = SCR_W - 72, py = BODY_Y + 1;
-        d.drawRoundRect(px, py, 68, 11, 2, n5 > 0 ? T_GOOD : T_DIM);
-        d.fillCircle(px + 5, py + 5, 2, n5 > 0 ? T_GOOD : 0x528A);
-        d.setTextColor(n5 > 0 ? T_GOOD : T_DIM, T_BG);
-        d.setCursor(px + 12, py + 2);
-        if (n5 > 0) d.printf("C5 x%d ONLINE", n5);
-        else        d.print("C5 not paired");
+    if (full) {
+        ui_force_clear_body();
+        ui_ambient_tick(0, BODY_Y, SCR_W, BODY_H);
     }
-
-    if (n > rows) {
-        char pos[12];
-        snprintf(pos, sizeof(pos), "%d/%d", cursor + 1, n);
-        int pw = d.textWidth(pos);
-        d.setTextColor(T_DIM, T_BG);
-        d.setCursor(SCR_W - pw - 4, BODY_Y + 2);
-        d.print(pos);
-    }
-
+    char position[24];
+    snprintf(position, sizeof(position), "%d/%d", cursor + 1, n);
+    ui_header(parent->label, position);
     for (int r = 0; r < rows && first + r < n; ++r) {
-        int i = first + r;
-        const menu_node_t *c = &parent->children[i];
-        int y = first_y + r * row_h;
-        bool sel = (i == cursor);
-        if (sel) {
-            d.fillRoundRect(2, y - 1, SCR_W - 4, 12, 2, T_SEL_BG);
-            d.drawRoundRect(2, y - 1, SCR_W - 4, 12, 2, T_SEL_BD);
-            d.drawRoundRect(3, y,     SCR_W - 6, 10, 2, T_ACCENT);
-        }
-        uint16_t line_bg = sel ? T_SEL_BG : T_BG;
-        d.setTextColor(sel ? T_SEL_BD : T_ACCENT, line_bg);
-        d.setCursor(6, y + 1);
-        d.printf("[%c]", toupper(c->hotkey));
-        d.setTextColor(sel ? T_FG : T_DIM, line_bg);
-        d.setCursor(30, y + 1);
-        d.print(c->label);
-        d.setTextColor(sel ? T_ACCENT2 : T_DIM, line_bg);
-        d.setCursor(SCR_W - 12, y + 1);
-        d.print(c->action ? "." : ">");
+        if (full || first + r == previous || first + r == cursor)
+            draw_menu_row(parent, first + r, r, cursor);
     }
-
-    if (first > 0) {
-        d.fillTriangle(SCR_W - 7, first_y - 3,
-                       SCR_W - 3, first_y - 3,
-                       SCR_W - 5, first_y - 6, T_ACCENT2);
-    }
-    if (first + rows < n) {
-        int ay = first_y + rows * row_h - 2;
-        d.fillTriangle(SCR_W - 7, ay,
-                       SCR_W - 3, ay,
-                       SCR_W - 5, ay + 3, T_ACCENT2);
-    }
-
-    /* Hint strip for the selected item, below the visible rows. */
-    if (cursor >= 0 && cursor < n) {
-        const menu_node_t *sel = &parent->children[cursor];
-        if (sel->hint) {
-            int visible = (n < rows) ? n : rows;
-            int y = first_y + visible * row_h + 2;
-            if (y < FOOTER_Y - 10) {
-                d.setTextColor(T_DIM, T_BG);
-                d.setCursor(4, y);
-                d.print("» ");
-                d.print(sel->hint);
-            }
-        }
-    }
+    ui_scrollbar(SCR_W - 3, BODY_Y + 19, 84, first, rows, n);
+    d.fillRect(4, BODY_Y + 103, SCR_W - 8, 10, T_BG);
+    ui_label(6, BODY_Y + 104, SCR_W - 12, T_DIM, T_BG, parent->children[cursor].hint);
+    Serial.printf("[UI_PAINT] list %lums\n", (unsigned long)(millis() - paint_started));
 }
 
 /* Set by run_submenu before invoking a feature's action, so the feature
  * can look up its own long-form help via ui_show_current_help(). */
 const menu_node_t *g_current_feature_item = nullptr;
+
+void menu_execute_action(const menu_node_t *item)
+{
+    if (!item || !item->action) return;
+    const size_t baseline = heap_free_internal();
+    const size_t reclaimed = heap_reclaim_all();
+    Serial.printf("[FEAT_ENTER] %s free=%u largest=%u reclaimed=%u\n",
+                  item->label, (unsigned)heap_free_internal(),
+                  (unsigned)heap_largest_internal(), (unsigned)reclaimed);
+    g_current_feature_item = item;
+    item->action();
+    g_current_feature_item = nullptr;
+    pinMode(44, OUTPUT);
+    digitalWrite(44, HIGH);
+    const size_t remaining = heap_free_internal();
+    const long delta = static_cast<long>(remaining) - static_cast<long>(baseline);
+    Serial.printf("[FEAT_EXIT] %s free=%u largest=%u delta=%ld%s\n",
+                  item->label, (unsigned)remaining, (unsigned)heap_largest_internal(),
+                  delta, delta < -2048 ? " LEAK" : "");
+    ui_status_invalidate();
+}
 
 /* Forward-decl so ui_show_current_help can delegate. */
 static void show_info(const menu_node_t *item);
@@ -1262,57 +1179,13 @@ void ui_show_current_help(void)
     show_info(g_current_feature_item);
 }
 
-/* Show detailed info for the selected item until any key pressed. */
+/* Show scrollable details until ENTER or Back. */
 static void show_info(const menu_node_t *item)
 {
-    auto &d = M5Cardputer.Display;
-    ui_force_clear_body();
-    d.setTextColor(T_ACCENT2, T_BG);
-    d.setCursor(4, BODY_Y + 2);
-    d.printf("[%c] %s", toupper(item->hotkey), item->label);
-    d.drawFastHLine(4, BODY_Y + 12, SCR_W - 8, T_ACCENT2);
-
-    d.setTextColor(T_ACCENT, T_BG);
-    d.setCursor(4, BODY_Y + 18);
-    d.printf("> %s", item->hint ? item->hint : "");
-
-    /* Word-wrapped info paragraph, ~38 chars per line at 6px font. */
-    if (item->info) {
-        d.setTextColor(T_FG, T_BG);
-        const char *p = item->info;
-        int y = BODY_Y + 34;
-        while (*p && y < FOOTER_Y - 8) {
-            /* Find a wrap point within 38 chars. */
-            int take = 0, last_space = -1;
-            while (p[take] && take < 38) {
-                if (p[take] == ' ') last_space = take;
-                take++;
-            }
-            if (p[take] && last_space > 0) take = last_space;
-            char line[40];
-            strncpy(line, p, take);
-            line[take] = '\0';
-            d.setCursor(4, y);
-            d.print(line);
-            y += 10;
-            p += take;
-            if (*p == ' ') p++;
-        }
-    } else {
-        d.setTextColor(T_DIM, T_BG);
-        d.setCursor(4, BODY_Y + 34);
-        d.print("(no detailed info)");
-    }
-
-    ui_draw_footer("any key = back");
-    while (true) {
-        uint16_t k = input_poll();
-        if (k != PK_NONE) return;
-        delay(40);
-    }
+    ui_show_text(item->label, item->info ? item->info : item->hint);
 }
 
-/* Slide-transition trampoline. ui_slide_transition takes a void(void)
+/* Navigation redraw trampoline. ui_slide_transition takes a void(void)
  * painter; we stash parent+cursor here so draw_menu has its args. */
 static const menu_node_t *s_slide_parent;
 static int                s_slide_cursor;
@@ -1324,7 +1197,7 @@ static void slide_to(const menu_node_t *p, int c, int dir) {
     ui_slide_transition(slide_paint, dir);
 }
 
-#define FOOTER_HINTS "letter=go  ;/.=move  ENTER=sel  ==info  `=back"
+#define FOOTER_HINTS "ENTER open = help ` back ;/. move letter jump"
 
 static void run_submenu(const menu_node_t *parent)
 {
@@ -1339,12 +1212,15 @@ static void run_submenu(const menu_node_t *parent)
 
     int cursor = 0;
     int n = count_children(parent);
+    if (n <= 0) return;
 
+    s_menu_force = true;
     ui_draw_status(radio_name(), "");
     ui_draw_footer(FOOTER_HINTS);
     draw_menu(parent, cursor);
 
     while (true) {
+        if (menu_style_get() != MENU_STYLE_TERMINAL) return;
         uint16_t k = input_poll();
         if (k == PK_NONE) {
             /* Screensaver takeover when idle threshold passes. Returns
@@ -1361,10 +1237,15 @@ static void run_submenu(const menu_node_t *parent)
              * so text never strobes. ~33 ms cadence matches carousel. */
             static uint32_t last_anim = 0;
             uint32_t now = millis();
-            if (now - last_anim > 33) {
+            if (ui_ambient_enabled() && ui_motion_enabled() && now - last_anim > 66) {
                 last_anim = now;
-                draw_menu_anim(parent, cursor);
+                // Ambient owns only the hint-free gutter, never list glyphs.
+                M5Cardputer.Display.fillRect(0, BODY_Y + 15, SCR_W, 3, T_BG);
+                M5Cardputer.Display.setClipRect(0, BODY_Y + 15, SCR_W, 3);
+                ui_ambient_tick(0, BODY_Y, SCR_W, BODY_H);
+                M5Cardputer.Display.clearClipRect();
             }
+            ui_draw_status(radio_name(), "");
             delay(10);
             continue;
         }
@@ -1377,43 +1258,22 @@ static void run_submenu(const menu_node_t *parent)
             s_menu_force = true;
             draw_menu(parent, cursor);
             ui_draw_footer(FOOTER_HINTS);
+            ui_draw_status(radio_name(), "");
             continue;
         }
         if (k == PK_ENTER) {
             const menu_node_t *sel = &parent->children[cursor];
             if (sel->action) {
-                /* Baseline is captured BEFORE reclaim so a cache freed here and
-                 * lazily reallocated by the feature (e.g. the ARGUS sprite) nets
-                 * ~0 in the exit delta instead of a phantom LEAK. Reclaim still
-                 * runs so the feature starts from a maximally free heap.
-                 * Note: the first use of a lazy-once feature (wardrive, cctv,
-                 * ciw) legitimately allocates permanent state and will show a
-                 * one-time negative delta -- an expected non-leak. */
-                size_t hb_base = heap_free_internal();
-                size_t hb_reclaimed = heap_reclaim_all();
-                Serial.printf("[FEAT_ENTER] %s free=%u reclaimed=%u\n",
-                              sel->label, (unsigned)heap_free_internal(),
-                              (unsigned)hb_reclaimed);
-                g_current_feature_item = sel;
-                sel->action();
-                g_current_feature_item = nullptr;
-                /* Defensive IR park — IR features should self-park HIGH
-                 * but if any path skips that, the LED stays glowing.
-                 * Hard-set OFF here after every feature returns. */
-                pinMode(44, OUTPUT); digitalWrite(44, HIGH);
-                { size_t hb_now = heap_free_internal();
-                  long hb_d = (long)hb_now - (long)hb_base;
-                  Serial.printf("[FEAT_EXIT] %s free=%u delta=%ld%s\n",
-                      sel->label, (unsigned)hb_now, hb_d, hb_d < -2048 ? " LEAK" : ""); }
+                menu_execute_action(sel);
                 ui_draw_status(radio_name(), "");
                 ui_draw_footer(FOOTER_HINTS);
                 s_menu_force = true;
                 draw_menu(parent, cursor);
             } else if (sel->children) {
-                /* Slide into the child submenu. */
+                /* Open the child submenu without animation buffers. */
                 slide_to(sel, 0, +1);
                 run_submenu(sel);
-                /* Slide back to parent after child returns. */
+                /* Restore the parent after the child returns. */
                 ui_draw_status(radio_name(), "");
                 ui_draw_footer(FOOTER_HINTS);
                 slide_to(parent, cursor, -1);
@@ -1433,20 +1293,7 @@ static void run_submenu(const menu_node_t *parent)
                     cursor = i;
                     draw_menu(parent, cursor);
                     if (ch->action) {
-                        size_t hb_base = heap_free_internal();
-                        size_t hb_reclaimed = heap_reclaim_all();
-                        Serial.printf("[FEAT_ENTER] %s free=%u reclaimed=%u\n",
-                                      ch->label, (unsigned)heap_free_internal(),
-                                      (unsigned)hb_reclaimed);
-                        g_current_feature_item = ch;
-                        ch->action();
-                        g_current_feature_item = nullptr;
-                        /* Defensive IR park — same as above. */
-                        pinMode(44, OUTPUT); digitalWrite(44, HIGH);
-                        { size_t hb_now = heap_free_internal();
-                          long hb_d = (long)hb_now - (long)hb_base;
-                          Serial.printf("[FEAT_EXIT] %s free=%u delta=%ld%s\n",
-                              ch->label, (unsigned)hb_now, hb_d, hb_d < -2048 ? " LEAK" : ""); }
+                        menu_execute_action(ch);
                         ui_draw_status(radio_name(), "");
                         ui_draw_footer(FOOTER_HINTS);
                         s_menu_force = true;
@@ -1467,5 +1314,9 @@ static void run_submenu(const menu_node_t *parent)
 
 void menu_run(void)
 {
-    run_submenu(&MENU_ROOT);
+    while (true) {
+        const menu_style_t before = menu_style_get();
+        run_submenu(&MENU_ROOT);
+        if (before == menu_style_get()) return;
+    }
 }

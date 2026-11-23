@@ -3,9 +3,14 @@
  *
  * Hardware: HAT sits on the Cardputer's expansion header and exposes
  * the u-blox GPS module on UART1. Cardputer ADV pinout:
- *   GPIO 15 = GPS TX  (module → MCU)
- *   GPIO 13 = GPS RX  (MCU → module)
- *   9600 baud, 8N1
+ *   GPIO 15 = GPS TX  (module → MCU)   MCU RX. Hydra does not use this pad.
+ *   GPIO 13 = GPS RX  (MCU → module)   MCU TX. Hydra CC1101 CS is this pad.
+ *   115200 baud, 8N1 on the CAP-LoRa1262 module
+ *
+ * The PINGEQUA Hydra RF Cap is a different hat (CC1101 CS=13, GDO0=5,
+ * nRF24 CS=6, CE=4). Only GPIO 13 is shared with GPS, so CC1101 and
+ * nRF24 bring-up call gps_end() before driving CC1101 CS. GDO0 does
+ * not conflict with this UART.
  *
  * We poll the UART every 100ms, parse GGA + RMC sentences, keep the
  * last valid fix in a global struct. Non-blocking — safe to call from
@@ -17,7 +22,7 @@
 
 #define GPS_UART_RX_PIN 15
 #define GPS_UART_TX_PIN 13
-#define GPS_BAUD        9600
+#define GPS_BAUD        115200
 
 struct gps_fix_t {
     bool     valid;          /* true when we have a 3D fix */
@@ -35,6 +40,11 @@ struct gps_fix_t {
 
 bool gps_begin(void);
 void gps_end(void);
+
+/* After Hydra (or the UART shell) releases GPIO 13: if the user opted
+ * into GPS, bring the UART back and respawn the poller gps_end() stopped.
+ * Does nothing when GPS is disabled, so CC1101 CS can stay high. */
+void gps_resume_if_enabled(void);
 void gps_poll(void);
 
 /* rf-015: cheap "is the UART up?" probe so callers that conditionally
@@ -72,6 +82,10 @@ struct gps_diag_t {
     uint32_t gga;
     uint32_t rmc;
     uint32_t overflows;     /* gps-003: lines > 128 B truncated */
+    int      last_gga_quality;
+    char     last_rmc_status;
     char     last[96];
+    char     last_gga[96];
+    char     last_rmc[96];
 };
 const gps_diag_t &gps_diag(void);

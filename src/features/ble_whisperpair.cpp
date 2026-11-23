@@ -476,9 +476,8 @@ static wp_verdict_t run_probe(const wp_target_t &t)
 /* --- Logging ----------------------------------------------------------- */
 static void log_verdict(const wp_target_t &t, wp_verdict_t v)
 {
-    if (!sd_mount()) return;
-    SD.mkdir("/poseidon");
-    File f = SD.open("/poseidon/whisperpair.csv", FILE_APPEND);
+    if (!sd_ensure_layout()) return;
+    File f = SD.open(SD_WHISPERPAIR_PATH, FILE_APPEND);
     if (!f) return;
     const char *v_str = (v == WP_VULNERABLE)   ? "VULNERABLE"
                       : (v == WP_PATCHED)      ? "PATCHED"
@@ -520,7 +519,7 @@ static void draw_picker_row(int r, int idx, int cursor)
     }
     const wp_target_t &t = s_tgt[idx];
     bool sel = (idx == cursor);
-    uint16_t bg = sel ? 0x3007 : T_BG;
+    uint16_t bg = sel ? T_SEL_BG : T_BG;
     d.fillRect(0, y - 1, SCR_W, 12, bg);
 
     /* Mode tag. */
@@ -533,7 +532,7 @@ static void draw_picker_row(int r, int idx, int cursor)
 
     /* Name. */
     const char *nm = model_name(t.model_id);
-    d.setTextColor(sel ? 0xFFFF : T_FG, bg);
+    d.setTextColor(T_FG, bg);
     d.setCursor(34, y);
     if (nm) d.printf("%.22s", nm);
     else if (t.mode == WP_MODE_DISCOVERABLE)
@@ -681,7 +680,7 @@ static void draw_verdict(const wp_target_t &t, wp_verdict_t v)
     }
     d.setTextColor(T_DIM, T_BG);
     d.setCursor(4, BODY_Y + 72);
-    d.print("logged to /poseidon/whisperpair.csv");
+    d.print("logged to captures/ble/");
 }
 
 /* --- Entry point ------------------------------------------------------- */

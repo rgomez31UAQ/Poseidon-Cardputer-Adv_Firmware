@@ -369,13 +369,13 @@ void feat_c5_scan_5g(void)
                     int y = BODY_Y + 18 + r * 12;
                     bool sel = (i == cursor);
                     if (sel) d.fillRect(0, y - 1, SCR_W, 12, 0x3007);
-                    uint16_t rowbg = sel ? 0x3007 : T_BG;
+                    uint16_t rowbg = sel ? T_SEL_BG : T_BG;
                     /* Band badge. */
                     d.setTextColor(a.is_5g ? 0xF81F : T_ACCENT, rowbg);
                     d.setCursor(2, y);
                     d.print(a.is_5g ? "5G" : "2G");
                     /* RSSI */
-                    d.setTextColor(sel ? 0xFFFF : T_FG, rowbg);
+                    d.setTextColor(T_FG, rowbg);
                     d.setCursor(20, y);
                     d.printf("%4d", a.rssi);
                     /* Auth — highlight PMF-implying modes in red so
@@ -522,7 +522,7 @@ void feat_c5_deauth_5g(void)
                 int y = BODY_Y + 18 + r * 12;
                 bool sel = (i == cursor);
                 if (sel) d.fillRect(0, y - 1, SCR_W, 12, 0x3007);
-                d.setTextColor(sel ? T_ACCENT : T_FG, sel ? 0x3007 : T_BG);
+                d.setTextColor(sel ? T_ACCENT : T_FG, sel ? T_SEL_BG : T_BG);
                 d.setCursor(2, y);
                 d.printf("%4d ch%-3u %.20s", a.rssi, a.channel,
                          a.ssid[0] ? a.ssid : "<hidden>");
@@ -718,7 +718,8 @@ static void save_hs_to_sd(const c5_hs_t &h, const char *essid)
 {
     if (!sd_mount()) return;
     SD.mkdir("/poseidon");
-    File f = SD.open("/poseidon/hashcat.22000", FILE_APPEND);
+    sd_ensure_layout();
+    File f = SD.open(SD_HASHCAT_PATH, FILE_APPEND);
     if (!f) return;
     char line[512];
     int n = hs_format_22000(line, sizeof(line), h.bssid, h.sta, h.anonce,
@@ -732,7 +733,8 @@ static void save_pmkid_to_sd(const c5_pmkid_t &p)
 {
     if (!sd_mount()) return;
     SD.mkdir("/poseidon");
-    File f = SD.open("/poseidon/hashcat.22000", FILE_APPEND);
+    sd_ensure_layout();
+    File f = SD.open(SD_HASHCAT_PATH, FILE_APPEND);
     if (!f) return;
     /* hashcat 22000 WPA*01* format:
      *   WPA*01*<pmkid>*<bssid>*<sta>*<essid_hex>***  */
@@ -789,7 +791,7 @@ void feat_c5_pmkid_5g(void)
                 int y = BODY_Y + 18 + r * 12;
                 bool sel = (i == cursor);
                 if (sel) d.fillRect(0, y - 1, SCR_W, 12, 0x3007);
-                d.setTextColor(sel ? T_ACCENT : T_FG, sel ? 0x3007 : T_BG);
+                d.setTextColor(sel ? T_ACCENT : T_FG, sel ? T_SEL_BG : T_BG);
                 d.setCursor(2, y);
                 d.printf("%4d ch%-3u %.20s", a.rssi, a.channel,
                          a.ssid[0] ? a.ssid : "<hidden>");
@@ -881,7 +883,7 @@ void feat_c5_pmkid_5g(void)
  * The HS capture runs concurrently with the deauth on the C5 side —
  * it's already listening when clients re-auth after getting kicked.
  * Anything caught streams back as RESP_HS and gets written to
- * /poseidon/hashcat.22000 in WPA*02* format. PMKIDs from the same
+ * /poseidon/captures/wifi/hashcat.22000 in WPA*02* format. PMKIDs from the same
  * target (if any) flush through the same loop.
  *
  * Runs until ESC. No time-slicing with the S3 side — this is the

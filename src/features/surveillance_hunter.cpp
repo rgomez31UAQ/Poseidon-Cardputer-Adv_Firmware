@@ -4,17 +4,16 @@
  * beacon/probe, scores against sigdb_surveillance.h.
  *
  * Hits stream to two SD files:
- *   /poseidon/surv-<ts>.csv   WiGLE-format (importable into Plume tooling)
- *   /poseidon/surv-<ts>.json  JSONL one-event-per-line (Plume-compatible)
+ *   /poseidon/captures/surveillance/surv-<ts>.csv
+ *   /poseidon/captures/surveillance/surv-<ts>.jsonl
  *
  * GPS coords come from the existing gps_poll background task — same
  * source wardrive uses. Status bar shows live hit counts by class.
  *
- * BLE side (Raven manufacturer-ID 0x09C8 + custom GATT UUIDs) is a
- * follow-up — implementing here would require pausing WiFi promisc
- * and bouncing through NimBLE init/deinit, big complexity bump.
- * First cut is WiFi-only which already catches every Flock camera
- * (the high-value target). Raven side comes after this is proven.
+ * BLE Raven indicators are classified by the BLE scanner, which preserves
+ * RAVEN-BLE and RAVEN-UUID tags in its saved device CSV. The WiFi hunter
+ * remains focused on Flock indicators because the S3 cannot run WiFi
+ * promiscuous capture and NimBLE scanning concurrently.
  */
 #include "app.h"
 #include "../theme.h"
@@ -47,6 +46,41 @@ static File               s_csv;
 static File               s_jsonl;
 static char               s_csv_path[64]   = {0};
 static char               s_jsonl_path[64] = {0};
+
+static void csv_escape(const char *value, char *out, size_t out_size)
+{
+    size_t pos = 0;
+    if (out_size == 0) return;
+    for (const char *p = value ? value : ""; *p && pos + 2 < out_size; ++p) {
+        uint8_t c = (uint8_t)*p;
+        if (c < 0x20 || c >= 0x7F) c = '?';
+        if (c == '"') out[pos++] = '"';
+        out[pos++] = (char)c;
+    }
+    out[pos] = '\0';
+    if (strchr(out, ',') || strchr(out, '"')) {
+        size_t len = strlen(out);
+        if (len + 2 < out_size) {
+            memmove(out + 1, out, len + 1);
+            out[0] = '"';
+            out[len + 1] = '"';
+            out[len + 2] = '\0';
+        }
+    }
+}
+
+static void json_escape(const char *value, char *out, size_t out_size)
+{
+    size_t pos = 0;
+    if (out_size == 0) return;
+    for (const char *p = value ? value : ""; *p && pos + 2 < out_size; ++p) {
+        uint8_t c = (uint8_t)*p;
+        if (c < 0x20 || c >= 0x7F) c = '?';
+        if (c == '"' || c == '\\') out[pos++] = '\\';
+        out[pos++] = (char)c;
+    }
+    out[pos] = '\0';
+}
 
 /* Deferred log queue. promisc_cb runs in WiFi RX context — SD/FATFS
  * I/O from there will crash because the FATFS mutex may already be
@@ -90,9 +124,11 @@ static bool dedup_should_suppress(const uint8_t bssid[6], uint32_t now)
 static bool open_logs(void)
 {
     uint32_t ts = millis() / 1000;
-    snprintf(s_csv_path,   sizeof(s_csv_path),   "/poseidon/surv-%lu.csv",   (unsigned long)ts);
-    snprintf(s_jsonl_path, sizeof(s_jsonl_path), "/poseidon/surv-%lu.jsonl", (unsigned long)ts);
-    SD.mkdir("/poseidon");
+    if (!sd_ensure_layout()) return false;
+    snprintf(s_csv_path, sizeof(s_csv_path), SD_SURVEILLANCE_DIR "/surv-%lu.csv",
+             (unsigned long)ts);
+    snprintf(s_jsonl_path, sizeof(s_jsonl_path), SD_SURVEILLANCE_DIR "/surv-%lu.jsonl",
+             (unsigned long)ts);
 
     s_csv = SD.open(s_csv_path, FILE_WRITE);
     if (!s_csv) {
@@ -124,6 +160,10 @@ static void log_hit(surv_class_t cls, const uint8_t bssid[6],
                     const char *ssid, int8_t rssi, uint8_t channel)
 {
     if (!s_csv) return;
+    char escaped_ssid[70];
+    char escaped_json_ssid[70];
+    csv_escape(ssid, escaped_ssid, sizeof(escaped_ssid));
+    json_escape(ssid, escaped_json_ssid, sizeof(escaped_json_ssid));
     gps_fix_t g;
     bool have_gps = gps_snapshot(&g);
     const char *kind = surv_class_name(cls);
@@ -140,7 +180,7 @@ static void log_hit(surv_class_t cls, const uint8_t bssid[6],
 
     s_csv.printf("%02X:%02X:%02X:%02X:%02X:%02X,%s,[FLOCK],%s,%u,%d,%s,%s,%s,10,SURV-%s\n",
                  bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-                 ssid ? ssid : "",
+                 escaped_ssid,
                  have_gps ? g.date : "",
                  (unsigned)channel, (int)rssi,
                  lat, lon, alt,
@@ -156,7 +196,7 @@ static void log_hit(surv_class_t cls, const uint8_t bssid[6],
         s_jsonl.printf("{\"ts\":%lu,\"class\":\"%s\",\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ssid\":\"%s\",\"ch\":%u,\"rssi\":%d,\"lat\":%s}\n",
                        (unsigned long)millis(), kind,
                        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-                       ssid ? ssid : "",
+                       escaped_json_ssid,
                        (unsigned)channel, (int)rssi,
                        coords);
         s_jsonl.flush();
@@ -169,12 +209,16 @@ static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     const uint8_t *p = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
-    if (len < 36) return;
     uint8_t fc = p[0];
     uint8_t subtype = (fc >> 4) & 0xF;
 
     /* Beacon (8) + probe response (5) + probe request (4) */
     if (subtype != 0x8 && subtype != 0x5 && subtype != 0x4) return;
+    /* Probe requests have a 24-byte MAC header and can be much shorter than
+     * beacons. Reject only frames that cannot contain their tagged fields plus
+     * the captured FCS, otherwise wildcard probes are missed. */
+    int tag_offset = (subtype == 0x4) ? 24 : 36;
+    if (len < tag_offset + 4) return;
 
     /* For probe request, addr2 = src STA. For beacon/probe-resp, addr2 = AP BSSID. */
     const uint8_t *bssid = (subtype == 0x4) ? (p + 10) : (p + 16);
